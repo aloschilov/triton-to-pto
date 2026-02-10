@@ -7,7 +7,7 @@
 //===----------------------------------------------------------------------===//
 
 include "mlir/IR/OpBase.td"
-include "mlir/IR/Dialect.h.td"
+include "mlir/IR/DialectBase.td"
 
 def PTODialect : Dialect {
   let name = "pto";
@@ -15,23 +15,10 @@ def PTODialect : Dialect {
 }
 
 //===----------------------------------------------------------------------===//
-// Types (opaque in this skeleton; concrete typing lives in PTO ISA)
-//===----------------------------------------------------------------------===//
-
-// Tile type: !pto.tile<rowsxcolsxdtype>
-def PTOTileType : DialectType<PTODialect, "tile">;
-
-// Memref wrapper: !pto.memref<space, shape, dtype>
-def PTOMemRefType : DialectType<PTODialect, "memref">;
-
-// Event type: !pto.event
-def PTOEventType : DialectType<PTODialect, "event">;
-
-//===----------------------------------------------------------------------===//
 // Core Ops (subset)
 //===----------------------------------------------------------------------===//
 
-def PTOTLoadOp : Op<PTODialect, "tload", [Pure]> {
+def PTOTLoadOp : Op<PTODialect, "tload"> {
   let summary = "PTO tile load from memref";
   let description = [{
     Synchronous tile load operation, mirroring TLOAD from the PTO ISA.
@@ -45,10 +32,6 @@ def PTOTLoadOp : Op<PTODialect, "tload", [Pure]> {
   let results = (outs
     AnyType:$tile
   );
-
-  let assemblyFormat = [{
-    $tile `=` $opName $memref `[` $row `,` $col `]` `:` type($memref) `,` type($row) `,` type($col) `->` type($tile)
-  }];
 }
 
 def PTOTStoreOp : Op<PTODialect, "tstore"> {
@@ -64,13 +47,9 @@ def PTOTStoreOp : Op<PTODialect, "tstore"> {
     Index:$col
   );
   let results = (outs);
-
-  let assemblyFormat = [{
-    $opName $tile `,` $memref `[` $row `,` $col `]` `:` type($tile) `,` type($memref) `,` type($row) `,` type($col)
-  }];
 }
 
-def PTOTMatmulOp : Op<PTODialect, "tmatmul", [Pure]> {
+def PTOTMatmulOp : Op<PTODialect, "tmatmul"> {
   let summary = "PTO tile matmul";
   let description = [{
     Matrix multiply (GEMM) producing an accumulator/output tile.
@@ -83,13 +62,9 @@ def PTOTMatmulOp : Op<PTODialect, "tmatmul", [Pure]> {
   let results = (outs
     AnyType:$acc
   );
-
-  let assemblyFormat = [{
-    $acc `=` $opName $a `,` $b `:` `(` type($a) `,` type($b) `)` `->` type($acc)
-  }];
 }
 
-def PTOTAddOp : Op<PTODialect, "tadd", [Pure]> {
+def PTOTAddOp : Op<PTODialect, "tadd"> {
   let summary = "PTO tile add";
   let description = [{
     Elementwise add of two tiles.
@@ -102,9 +77,5 @@ def PTOTAddOp : Op<PTODialect, "tadd", [Pure]> {
   let results = (outs
     AnyType:$dst
   );
-
-  let assemblyFormat = [{
-    $dst `=` $opName $lhs `,` $rhs `:` type($lhs) `,` type($rhs) `->` type($dst)
-  }];
 }
 

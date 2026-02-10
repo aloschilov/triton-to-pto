@@ -1,0 +1,20 @@
+# MLIR / CMake build artifacts
+
+mlir_tool/build/
+mlir_tool/**/CMakeFiles/
+mlir_tool/**/CMakeCache.txt
+mlir_tool/**/cmake_install.cmake
+mlir_tool/**/Makefile
+
+# TableGen-generated headers in build tree (keep sources in include/)
+mlir_tool/build/**/*.inc
+
+# Editor / OS junk
+
+.DS_Store
+.idea/
+.vscode/
+*~
+*.swp
+*.swo
+

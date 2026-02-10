@@ -5,6 +5,7 @@ add_executable(triton-to-pto-mlir
 target_link_libraries(triton-to-pto-mlir
   PRIVATE
   MLIRIR
+  MLIRPass
   MLIRParser
   MLIRSupport
   PTOMLIRDialect

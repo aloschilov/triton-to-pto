@@ -29,33 +29,30 @@ struct TritonToPTO
     // counterparts by renaming them to pto.* while preserving operands and
     // result types. This is intentionally simplistic and meant as a starting
     // point before introducing proper OpConversionPatterns.
-    module.walk([](Operation *op) {
-      auto name = op->getName().getStringRef();
+    module.walk([&](Operation *op) {
+      StringRef name = op->getName().getStringRef();
 
-      auto mapName = [](StringRef oldName) -> Optional<std::string> {
-        if (oldName == "tt.load")
-          return std::string("pto.tload");
-        if (oldName == "tt.store")
-          return std::string("pto.tstore");
-        if (oldName == "tt.dot")
-          return std::string("pto.tmatmul");
-        if (oldName == "tt.add")
-          return std::string("pto.tadd");
-        // Leave all other ops unchanged in this skeleton.
-        return llvm::None;
-      };
+      StringRef newName;
+      if (name == "tt.load")
+        newName = "pto.tload";
+      else if (name == "tt.store")
+        newName = "pto.tstore";
+      else if (name == "tt.dot")
+        newName = "pto.tmatmul";
+      else if (name == "tt.add")
+        newName = "pto.tadd";
+      else
+        return;
 
-      if (Optional<std::string> newName = mapName(name)) {
-        OpBuilder builder(op);
-        OperationState st(op->getLoc(), *newName);
-        st.addOperands(op->getOperands());
-        st.addTypes(op->getResultTypes());
-        for (auto &namedAttr : op->getAttrs())
-          st.addAttribute(namedAttr.getName(), namedAttr.getValue());
-        Operation *newOp = builder.create(st);
-        op->replaceAllUsesWith(newOp);
-        op->erase();
-      }
+      OpBuilder builder(op);
+      OperationState st(op->getLoc(), newName);
+      st.addOperands(op->getOperands());
+      st.addTypes(op->getResultTypes());
+      for (auto &namedAttr : op->getAttrs())
+        st.addAttribute(namedAttr.getName(), namedAttr.getValue());
+      Operation *newOp = builder.create(st);
+      op->replaceAllUsesWith(newOp);
+      op->erase();
     });
   }
 };

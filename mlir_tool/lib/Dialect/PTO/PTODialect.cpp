@@ -7,19 +7,16 @@
 //===----------------------------------------------------------------------===//
 
 #include "pto-mlir/Dialect/PTO/PTODialect.h"
-
 #include "mlir/IR/DialectImplementation.h"
 
 using namespace mlir;
 using namespace pto;
 
-// Generated dialect and op declarations/definitions.
-#include "pto-mlir/Dialect/PTO/PTODialect.cpp.inc"
+PTODialect::PTODialect(mlir::MLIRContext *ctx)
+    : Dialect(getDialectNamespace(), ctx, mlir::TypeID::get<PTODialect>()) {}
 
 void PTODialect::initialize() {
-  addOperations<
-#define GET_OP_LIST
-#include "pto-mlir/Dialect/PTO/PTOOps.cpp.inc"
-      >();
+  // No registered ops yet; the current Triton→PTO pass only renames ops
+  // by name (tt.* -> pto.*) without relying on a typed PTO dialect.
 }
 

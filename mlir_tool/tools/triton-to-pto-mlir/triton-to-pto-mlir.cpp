@@ -13,11 +13,18 @@
 #include "mlir/IR/DialectRegistry.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OpDefinition.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Parser/Parser.h"
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Support/ToolUtilities.h"
 #include "mlir/Tools/mlir-translate/Translation.h"
+
+#include "llvm/Support/InitLLVM.h"
+#include "llvm/Support/MemoryBuffer.h"
+#include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Support/raw_ostream.h"
 
 #include "pto-mlir/Dialect/PTO/PTODialect.h"
 
@@ -33,8 +40,9 @@ int main(int argc, char **argv) {
   registry.insert<pto::PTODialect>();
 
   MLIRContext context(registry);
+  context.allowUnregisteredDialects(true);
 
-  llvm::InitLLVM y(argc, argv);
+  llvm::InitLLVM initLLVM(argc, argv);
 
   std::string inputFilename;
   std::string outputFilename;
@@ -50,24 +58,24 @@ int main(int argc, char **argv) {
   }
 
   std::string errorMessage;
-  auto input = openInputFile(inputFilename, &errorMessage);
-  if (!input) {
-    llvm::errs() << \"Error opening input: \" << errorMessage << \"\\n\";
-    return 1;
-  }
 
-  auto output = openOutputFile(outputFilename.empty() ? \"-\" : outputFilename,
+  auto output = openOutputFile(outputFilename.empty() ? "-" : outputFilename,
                                &errorMessage);
   if (!output) {
-    llvm::errs() << \"Error opening output: \" << errorMessage << \"\\n\";
+    llvm::errs() << "Error opening output: " << errorMessage << "\n";
     return 1;
   }
 
   // Parse module from input
+  if (inputFilename.empty()) {
+    llvm::errs() << "No input file specified\n";
+    return 1;
+  }
+  ParserConfig config(&context);
   OwningOpRef<ModuleOp> module =
-      parseSourceFile<ModuleOp>(input->getMemBufferRef(), &context);
+      parseSourceFile<ModuleOp>(inputFilename, config);
   if (!module) {
-    llvm::errs() << \"Failed to parse input MLIR module.\\n\";
+    llvm::errs() << "Failed to parse input MLIR module.\n";
     return 1;
   }
 
@@ -75,7 +83,7 @@ int main(int argc, char **argv) {
   pm.addPass(createTritonToPTOPass());
 
   if (failed(pm.run(*module))) {
-    llvm::errs() << \"Triton→PTO pass pipeline failed.\\n\";
+    llvm::errs() << "Triton->PTO pass pipeline failed.\n";
     return 1;
   }
 

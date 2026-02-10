@@ -28,6 +28,7 @@ message(STATUS "Found MLIR: ${MLIR_PACKAGE_VERSION}")
 include_directories(
   ${MLIR_INCLUDE_DIRS}
 )
+list(APPEND LLVM_TABLEGEN_FLAGS "-I${MLIR_INCLUDE_DIRS}")
 add_definitions(${MLIR_CMAKE_CXX_FLAGS})
 
 add_subdirectory(lib)

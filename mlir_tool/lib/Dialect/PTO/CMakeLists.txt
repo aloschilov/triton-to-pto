@@ -1,4 +1,6 @@
-set(LLVM_TARGET_DEFINITIONS PTOOps.td)
+set(LLVM_TARGET_DEFINITIONS
+  ${CMAKE_SOURCE_DIR}/include/pto-mlir/Dialect/PTO/PTOOps.td
+)
 
 mlir_tablegen(PTOOps.h.inc -gen-op-decls)
 mlir_tablegen(PTOOps.cpp.inc -gen-op-defs)
@@ -15,5 +17,11 @@ add_mlir_dialect_library(PTOMLIRDialect
 
   LINK_LIBS PUBLIC
   MLIRIR
+)
+
+target_include_directories(PTOMLIRDialect
+  PUBLIC
+  ${CMAKE_SOURCE_DIR}/include
+  ${CMAKE_BINARY_DIR}/lib/Dialect/PTO
 )
 
