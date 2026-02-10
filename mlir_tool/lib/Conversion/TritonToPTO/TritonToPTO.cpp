@@ -41,6 +41,8 @@ struct TritonToPTO
         newName = "pto.tmatmul";
       else if (name == "tt.add")
         newName = "pto.tadd";
+      else if (name == "arith.addf")
+        newName = "pto.tadd";
       else
         return;
 

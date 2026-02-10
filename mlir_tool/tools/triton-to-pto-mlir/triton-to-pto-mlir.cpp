@@ -26,7 +26,9 @@
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "pto-mlir/Dialect/PTO/PTODialect.h"
+#include "triton/Dialect/Triton/IR/Dialect.h"
 
 using namespace mlir;
 
@@ -35,12 +37,17 @@ std::unique_ptr<Pass> createTritonToPTOPass();
 
 int main(int argc, char **argv) {
   DialectRegistry registry;
-  // Register builtin + PTO dialects; Triton dialects can be registered here
-  // when linked in (e.g. registry.insert<triton::TritonDialect, ...>();).
-  registry.insert<pto::PTODialect>();
+  // Register PTO, Triton (tt), and dependent dialects needed for parsing.
+  registry.insert<pto::PTODialect,
+                  mlir::triton::TritonDialect,
+                  mlir::arith::ArithDialect>();
 
   MLIRContext context(registry);
   context.allowUnregisteredDialects(true);
+  // Eagerly load dialects so that tt.* and arith.* syntax is recognized.
+  context.getOrLoadDialect<mlir::triton::TritonDialect>();
+  context.getOrLoadDialect<pto::PTODialect>();
+  context.getOrLoadDialect<mlir::arith::ArithDialect>();
 
   llvm::InitLLVM initLLVM(argc, argv);
 

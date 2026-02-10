@@ -13,10 +13,13 @@ using namespace mlir;
 using namespace pto;
 
 PTODialect::PTODialect(mlir::MLIRContext *ctx)
-    : Dialect(getDialectNamespace(), ctx, mlir::TypeID::get<PTODialect>()) {}
+    : Dialect(getDialectNamespace(), ctx, mlir::TypeID::get<PTODialect>()) {
+  allowUnknownOperations(true);
+}
 
 void PTODialect::initialize() {
-  // No registered ops yet; the current Triton→PTO pass only renames ops
-  // by name (tt.* -> pto.*) without relying on a typed PTO dialect.
+  // Ops can be registered here via addOperations<#define GET_OP_LIST ...
+  // For now the convert-triton-to-pto pass creates pto.* ops by name;
+  // allowUnknownOperations permits them so the pipeline and print succeed.
 }
 
