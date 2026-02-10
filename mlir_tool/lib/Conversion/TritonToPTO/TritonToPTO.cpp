@@ -1,8 +1,10 @@
 //===- TritonToPTO.cpp - Triton→PTO conversion pass ----------------------===//
 //
-// Skeleton MLIR pass that will eventually lower Triton dialect ops (tt.*, ttg.*)
-// to PTO ops in the PTO dialect. At the moment this file only wires up a
-// placeholder pass and demonstrates how to walk Triton ops.
+// Minimal MLIR pass that currently lowers a small set of Triton dialect ops
+// (tt.*, arith.*) to PTO ops in the PTO dialect by simple renaming.
+// It is type-agnostic and therefore works for both scalar and 1D tensor
+// kernels (e.g. vector add with tt.make_range/tt.addptr/tt.load/arith.addf/
+// tt.store as exercised in mlir_tool/test/vec_add_triton.mlir).
 //
 //===----------------------------------------------------------------------===//
 
