@@ -1,20 +1,46 @@
 # MLIR / CMake build artifacts
-
 mlir_tool/build/
+build/
 mlir_tool/**/CMakeFiles/
+**/CMakeFiles/
 mlir_tool/**/CMakeCache.txt
+**/CMakeCache.txt
 mlir_tool/**/cmake_install.cmake
+**/cmake_install.cmake
 mlir_tool/**/Makefile
-
+**/Makefile
+**/compile_commands.json
 # TableGen-generated headers in build tree (keep sources in include/)
 mlir_tool/build/**/*.inc
 
-# Editor / OS junk
+# Lit test runner (generated timings)
+.lit_test_times.txt
+**/.lit_test_times.txt
 
+# Python
+.env/
+.venv/
+venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+.eggs/
+dist/
+
+# Editor / OS
 .DS_Store
+Thumbs.db
 .idea/
 .vscode/
+.cursor/
 *~
 *.swp
 *.swo
+*.bak
+*.tmp
 
+# Logs
+*.log

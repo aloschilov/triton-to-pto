@@ -32,6 +32,8 @@ def PTOTLoadOp : Op<PTODialect, "tload"> {
   let results = (outs
     AnyType:$tile
   );
+
+  let assemblyFormat = "$memref `[` $row `,` $col `]` attr-dict `:` type($memref) `->` type($tile)";
 }
 
 def PTOTStoreOp : Op<PTODialect, "tstore"> {
@@ -47,6 +49,8 @@ def PTOTStoreOp : Op<PTODialect, "tstore"> {
     Index:$col
   );
   let results = (outs);
+
+  let assemblyFormat = "$tile `,` $memref `[` $row `,` $col `]` attr-dict `:` type($tile) `,` type($memref)";
 }
 
 def PTOTMatmulOp : Op<PTODialect, "tmatmul"> {
@@ -77,5 +81,8 @@ def PTOTAddOp : Op<PTODialect, "tadd"> {
   let results = (outs
     AnyType:$dst
   );
+
+  // Parse both operand types so TableGen can build the op; result type matches.
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($lhs) `,` type($rhs) `->` type($dst)";
 }
 

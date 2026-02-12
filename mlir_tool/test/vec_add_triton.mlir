@@ -1,54 +1,52 @@
 // RUN: %triton_to_pto_mlir %s -o - | %filecheck %s
-
-// A more realistic Triton-style vector add kernel that uses a 1D range,
-// pointer arithmetic, vector loads/stores, and a size argument.
+//
+// -----------------------------------------------------------------------------
+// Expected PTO-AS reference (vector add) — see pto-isa docs/grammar/PTO-AS.md,
+// docs/isa/TLOAD.md, TADD.md, TSTORE.md, and docs/machine/abstract-machine.md.
+// Full lowering converts tt.func to func.func with !pto.memref args and
+// tt.load/arith.addf/tt.store to pto.tload/pto.tadd/pto.tstore with !pto.tile.
+// -----------------------------------------------------------------------------
+//
+// Real Triton IR (get_program_id, masked load/store, offset arithmetic).
 //
 module {
-  tt.func public @vector_add_kernel(
-    %arg0: !tt.ptr<f32>,   // x_ptr
-    %arg1: !tt.ptr<f32>,   // y_ptr
-    %arg2: !tt.ptr<f32>,   // out_ptr
-    %arg3: i32             // n_elements
+  tt.func public @add_kernel(
+    %x_ptr: !tt.ptr<f32>,
+    %y_ptr: !tt.ptr<f32>,
+    %output_ptr: !tt.ptr<f32>,
+    %n_elements: i32
   ) attributes {noinline = false} {
-
-    // 1. Setup Block Size (e.g., 1024)
-    %cst_1024 = arith.constant 1024 : i32
-
-    // 2. Generate Offsets: tl.arange(0, 1024)
-    %range = tt.make_range {start = 0 : i32, end = 1024 : i32} : tensor<1024xi32>
-
-    // 3. Pointer Arithmetic for X: x_ptr + offsets
-    %x_base = tt.splat %arg0 : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>>
-    %x_ptrs = tt.addptr %x_base, %range
-      : tensor<1024x!tt.ptr<f32>>, tensor<1024xi32>
-
-    // 4. Pointer Arithmetic for Y: y_ptr + offsets
-    %y_base = tt.splat %arg1 : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>>
-    %y_ptrs = tt.addptr %y_base, %range
-      : tensor<1024x!tt.ptr<f32>>, tensor<1024xi32>
-
-    // 5. Load Data
-    %x_vals = tt.load %x_ptrs : tensor<1024x!tt.ptr<f32>>
-    %y_vals = tt.load %y_ptrs : tensor<1024x!tt.ptr<f32>>
-
-    // 6. The Core Vector Addition
-    %result = arith.addf %x_vals, %y_vals : tensor<1024xf32>
-
-    // 7. Store Data: out_ptr + offsets
-    %out_base = tt.splat %arg2 : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>>
-    %out_ptrs = tt.addptr %out_base, %range
-      : tensor<1024x!tt.ptr<f32>>, tensor<1024xi32>
-    tt.store %out_ptrs, %result : tensor<1024x!tt.ptr<f32>>
-
+    %c1024_i32 = arith.constant 1024 : i32
+    %pid = tt.get_program_id x : i32
+    %block_start = arith.muli %pid, %c1024_i32 : i32
+    %offsets = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32>
+    %0 = tt.splat %block_start : i32 -> tensor<1024xi32>
+    %1 = arith.addi %0, %offsets : tensor<1024xi32>
+    %2 = tt.splat %n_elements : i32 -> tensor<1024xi32>
+    %mask = arith.cmpi slt, %1, %2 : tensor<1024xi32>
+    %3 = tt.splat %x_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>>
+    %4 = tt.addptr %3, %1 : tensor<1024x!tt.ptr<f32>>, tensor<1024xi32>
+    %x = tt.load %4, %mask : tensor<1024x!tt.ptr<f32>>
+    %5 = tt.splat %y_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>>
+    %6 = tt.addptr %5, %1 : tensor<1024x!tt.ptr<f32>>, tensor<1024xi32>
+    %y = tt.load %6, %mask : tensor<1024x!tt.ptr<f32>>
+    %output = arith.addf %x, %y : tensor<1024xf32>
+    %7 = tt.splat %output_ptr : !tt.ptr<f32> -> tensor<1024x!tt.ptr<f32>>
+    %8 = tt.addptr %7, %1 : tensor<1024x!tt.ptr<f32>>, tensor<1024xi32>
+    tt.store %8, %output, %mask : tensor<1024x!tt.ptr<f32>>
     tt.return
   }
 }
 
-// CHECK-LABEL: tt.func public @vector_add_kernel
-// Expect two loads lowered to PTO, one add consuming them, and one store.
-// Output uses numeric SSA names and may include attributes on PTO ops.
-// CHECK: %[[X:.*]] = "pto.tload"(%{{.*}}) {{.*}} : (tensor<1024x!tt.ptr<f32>>) -> tensor<1024xf32>
-// CHECK: %[[Y:.*]] = "pto.tload"(%{{.*}}) {{.*}} : (tensor<1024x!tt.ptr<f32>>) -> tensor<1024xf32>
-// CHECK: %[[RES:.*]] = "pto.tadd"(%[[X]], %[[Y]]) {{.*}} : (tensor<1024xf32>, tensor<1024xf32>) -> tensor<1024xf32>
-// CHECK: "pto.tstore"(%{{.*}}, %[[RES]]) {{.*}} : (tensor<1024x!tt.ptr<f32>>, tensor<1024xf32>) -> ()
-
+// CHECK-LABEL: func.func @add_kernel
+// CHECK: !pto.memref<1x1x1x16x64xf32>
+// CHECK: !pto.memref<1x1x1x16x64xf32>
+// CHECK: !pto.memref<1x1x1x16x64xf32>
+// CHECK: i32)
+// CHECK-DAG: arith.constant 0 : index
+// CHECK: pto.tload {{.*}}[{{.*}}, {{.*}}] : !pto.memref<1x1x1x16x64xf32> -> !pto.tile<16x64xf32>
+// CHECK: pto.tload {{.*}}[{{.*}}, {{.*}}] : !pto.memref<1x1x1x16x64xf32> -> !pto.tile<16x64xf32>
+// CHECK: pto.tadd {{.*}} : !pto.tile<16x64xf32>, !pto.tile<16x64xf32> -> !pto.tile<16x64xf32>
+// CHECK: pto.tstore {{.*}} : !pto.tile<16x64xf32>, !pto.memref<1x1x1x16x64xf32>
+// CHECK: return
+// CHECK-NOT: tt.
