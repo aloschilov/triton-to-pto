@@ -9,7 +9,10 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/Patterns.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Pass/Pass.h"
@@ -22,6 +25,8 @@
 #include "PTOOps.h.inc"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/Support/Casting.h"
+
+#include <optional>
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -99,6 +104,10 @@ public:
       }
       if (type.isIntOrIndex() || llvm::isa<FloatType>(type))
         return type;
+      // PTO types are already in the target form -- identity conversion.
+      if (llvm::isa<pto::TileBufType, pto::PtrType, pto::TensorViewType,
+                    pto::PartitionTensorViewType>(type))
+        return type;
       return std::nullopt;
     });
     addConversion([this](RankedTensorType type) -> std::optional<Type> {
@@ -111,6 +120,23 @@ public:
       auto [rows, cols] = computeTileShape(n, elem);
       return pto::TileBufType::get(type.getContext(), {rows, cols}, elem);
     });
+
+    // Materializations: needed by convertRegionTypes (e.g. scf.for bodies)
+    // to create temporary casts between tensor and tile_buf types.
+    addSourceMaterialization(
+        [](OpBuilder &builder, Type resultType, ValueRange inputs,
+           Location loc) -> Value {
+          return builder
+              .create<UnrealizedConversionCastOp>(loc, resultType, inputs)
+              .getResult(0);
+        });
+    addTargetMaterialization(
+        [](OpBuilder &builder, Type resultType, ValueRange inputs,
+           Location loc) -> Value {
+          return builder
+              .create<UnrealizedConversionCastOp>(loc, resultType, inputs)
+              .getResult(0);
+        });
   }
 
 private:
@@ -125,6 +151,58 @@ static BlockArgument traceBasePointer(Value v) {
   if (auto splat = v.getDefiningOp<SplatOp>())
     return traceBasePointer(splat.getSrc());
   return dyn_cast<BlockArgument>(v);
+}
+
+// Given an operation and a function-level block argument, find the
+// corresponding converted block arg in the function entry block. This
+// works even when `op` is inside a nested region (e.g. scf.for body).
+static Value resolveConvertedFuncArg(Operation *op, BlockArgument baseArg) {
+  // Walk up to the enclosing function entry block.
+  Operation *parentOp = op;
+  while (parentOp && !isa<func::FuncOp>(parentOp) &&
+         !isa<triton::FuncOp>(parentOp))
+    parentOp = parentOp->getParentOp();
+  if (!parentOp)
+    return nullptr;
+  Block &entryBlock = parentOp->getRegion(0).front();
+  unsigned idx = baseArg.getArgNumber();
+  if (idx >= entryBlock.getNumArguments())
+    return nullptr;
+  return entryBlock.getArgument(idx);
+}
+
+// For scalar store: when ptr is addptr(base, scalar_offset), return (base, row, col)
+// with row = offset as index and col = 0; otherwise (base, c0, c0).
+struct ScalarStoreIndices {
+  Value basePtr;
+  Value row;
+  Value col;
+};
+static std::optional<ScalarStoreIndices>
+getScalarStoreIndices(Value origPtr, Operation *op,
+                      ConversionPatternRewriter &rewriter) {
+  BlockArgument baseArg = traceBasePointer(origPtr);
+  if (!baseArg)
+    return std::nullopt;
+  Value basePtr = resolveConvertedFuncArg(op, baseArg);
+  if (!basePtr)
+    return std::nullopt;
+  Location loc = origPtr.getLoc();
+  Type indexType = rewriter.getIndexType();
+  Value c0 = rewriter.create<arith::ConstantOp>(
+      loc, rewriter.getIntegerAttr(indexType, 0));
+  if (auto addptr = origPtr.getDefiningOp<AddPtrOp>()) {
+    Value offsetVal = addptr.getOperand(1);
+    if (offsetVal.getType().isIndex()) {
+      return ScalarStoreIndices{basePtr, offsetVal, c0};
+    }
+    if (offsetVal.getType().isInteger(32) || offsetVal.getType().isInteger(64)) {
+      Value row = rewriter.create<arith::IndexCastUIOp>(loc, indexType,
+                                                        offsetVal);
+      return ScalarStoreIndices{basePtr, row, c0};
+    }
+  }
+  return ScalarStoreIndices{basePtr, c0, c0};
 }
 
 // Classify pointer block arguments of a Triton function as scalar outputs vs.
@@ -278,7 +356,9 @@ struct ConvertTTLoadOp : public OpConversionPattern<LoadOp> {
     if (!baseArg)
       return rewriter.notifyMatchFailure(op, "could not trace base pointer");
     const TypeConverter *conv = getTypeConverter();
-    Value ptr = op->getBlock()->getArgument(baseArg.getArgNumber());
+    Value ptr = resolveConvertedFuncArg(op, baseArg);
+    if (!ptr)
+      return rewriter.notifyMatchFailure(op, "could not resolve func arg");
     auto tileBufType = llvm::dyn_cast_or_null<pto::TileBufType>(
         conv->convertType(op.getType()));
     if (!tileBufType)
@@ -366,7 +446,9 @@ struct ConvertTTStoreOp : public ConversionPattern {
     if (!baseArg)
       return rewriter.notifyMatchFailure(op, "could not trace base pointer");
 
-    Value ptr = op->getBlock()->getArgument(baseArg.getArgNumber());
+    Value ptr = resolveConvertedFuncArg(op, baseArg);
+    if (!ptr)
+      return rewriter.notifyMatchFailure(op, "could not resolve func arg");
     Value value = operands[1];
     Location loc = op->getLoc();
     Type indexType = rewriter.getIndexType();
@@ -395,9 +477,42 @@ struct ConvertTTStoreOp : public ConversionPattern {
           loc, partType, tv, c0, c0, cRows, cCols);
       rewriter.create<pto::PTOTStoreOp>(loc, value, pv);
     } else {
-      rewriter.create<pto::PTOSStoreOp>(loc, value, ptr, c0, c0);
+      std::optional<ScalarStoreIndices> indices =
+          getScalarStoreIndices(origPtr, op, rewriter);
+      if (!indices)
+        return rewriter.notifyMatchFailure(op, "could not get scalar store indices");
+      rewriter.create<pto::PTOSStoreOp>(loc, value, indices->basePtr,
+                                        indices->row, indices->col);
     }
     rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+// scf.for / scf.yield type conversion is handled by the built-in
+// populateSCFStructuralTypeConversionsAndLegality() from MLIRSCFTransforms.
+
+// Convert tensor-typed arith.constant to pto.constant_tile (splat).
+struct ConvertArithConstantOp : public OpConversionPattern<arith::ConstantOp> {
+  ConvertArithConstantOp(TypeConverter &typeConverter, PatternBenefit benefit,
+                         MLIRContext *ctx)
+      : OpConversionPattern(typeConverter, ctx, benefit) {}
+
+  LogicalResult
+  matchAndRewrite(arith::ConstantOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto tensorType = llvm::dyn_cast<RankedTensorType>(op.getType());
+    if (!tensorType)
+      return rewriter.notifyMatchFailure(op, "not a tensor type");
+    Type newType = getTypeConverter()->convertType(tensorType);
+    auto tileBufType = llvm::dyn_cast_or_null<pto::TileBufType>(newType);
+    if (!tileBufType)
+      return rewriter.notifyMatchFailure(op, "could not convert to tile_buf");
+    auto dense = llvm::dyn_cast<DenseElementsAttr>(op.getValue());
+    if (!dense || !dense.isSplat())
+      return rewriter.notifyMatchFailure(op, "constant must be splat");
+    rewriter.replaceOpWithNewOp<pto::PTOConstantTileOp>(
+        op, tileBufType, llvm::cast<ElementsAttr>(op.getValue()));
     return success();
   }
 };
@@ -476,7 +591,7 @@ struct TritonToPTO : public PassWrapper<TritonToPTO, OperationPass<ModuleOp>> {
 
   void getDependentDialects(DialectRegistry &registry) const override {
     registry.insert<pto::PTODialect, triton::TritonDialect, func::FuncDialect,
-                    arith::ArithDialect>();
+                    arith::ArithDialect, mlir::scf::SCFDialect>();
   }
 
   StringRef getArgument() const final { return "convert-triton-to-pto"; }
@@ -496,6 +611,8 @@ struct TritonToPTO : public PassWrapper<TritonToPTO, OperationPass<ModuleOp>> {
                  ConvertArithAddFOp, ConvertTTStoreOp>(typeConverter,
                                                       &getContext());
     patterns.add<ConvertTTReduceOp>(typeConverter, &getContext());
+    patterns.add<ConvertArithConstantOp>(typeConverter, /*benefit=*/2,
+                                         &getContext());
     patterns.add<EraseTritonOp<GetProgramIdOp>, EraseTritonOp<MakeRangeOp>,
                  EraseTritonOp<SplatOp>, EraseTritonOp<AddPtrOp>>(
         typeConverter, &getContext());
@@ -523,6 +640,10 @@ struct TritonToPTO : public PassWrapper<TritonToPTO, OperationPass<ModuleOp>> {
       return std::optional<bool>(
           !llvm::isa<RankedTensorType>(op.getResult().getType()));
     });
+    target.addLegalOp<UnrealizedConversionCastOp>();
+    // Use built-in SCF structural type conversions for scf.for/scf.yield.
+    mlir::scf::populateSCFStructuralTypeConversionsAndLegality(
+        typeConverter, patterns, target);
 
     if (failed(applyPartialConversion(module, target, std::move(patterns))))
       signalPassFailure();

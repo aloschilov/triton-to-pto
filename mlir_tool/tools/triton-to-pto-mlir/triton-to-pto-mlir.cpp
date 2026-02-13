@@ -28,6 +28,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "pto-mlir/Dialect/PTO/PTODialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
@@ -41,7 +42,8 @@ int main(int argc, char **argv) {
   registry.insert<pto::PTODialect,
                   mlir::triton::TritonDialect,
                   mlir::arith::ArithDialect,
-                  mlir::func::FuncDialect>();
+                  mlir::func::FuncDialect,
+                  mlir::scf::SCFDialect>();
 
   MLIRContext context(registry);
   context.allowUnregisteredDialects(true);
@@ -49,6 +51,7 @@ int main(int argc, char **argv) {
   context.getOrLoadDialect<pto::PTODialect>();
   context.getOrLoadDialect<mlir::arith::ArithDialect>();
   context.getOrLoadDialect<mlir::func::FuncDialect>();
+  context.getOrLoadDialect<mlir::scf::SCFDialect>();
 
   llvm::InitLLVM initLLVM(argc, argv);
 

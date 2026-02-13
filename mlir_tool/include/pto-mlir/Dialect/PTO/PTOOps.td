@@ -187,6 +187,18 @@ def PTOAllocTileOp : Op<PTO_Dialect, "alloc_tile"> {
   let assemblyFormat = "attr-dict `:` type($result)";
 }
 
+def PTOConstantTileOp : Op<PTO_Dialect, "constant_tile"> {
+  let summary = "Constant tile (splat value)";
+  let description = [{
+    Produces a tile buffer filled with a constant splat value.
+  }];
+
+  let arguments = (ins ElementsAttr:$value);
+  let results = (outs PTO_TileBufType:$result);
+
+  let assemblyFormat = "$value attr-dict `:` type($result)";
+}
+
 //===----------------------------------------------------------------------===//
 // Core Ops (DPS format: ins/outs)
 //===----------------------------------------------------------------------===//

@@ -7,6 +7,8 @@ add_mlir_library(TritonToPTOPass
   MLIRTransforms
   MLIRArithDialect
   MLIRFuncDialect
+  MLIRSCFDialect
+  MLIRSCFTransforms
   PTOMLIRDialect
   TritonIR
 )

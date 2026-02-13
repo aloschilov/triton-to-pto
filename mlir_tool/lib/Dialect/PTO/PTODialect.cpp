@@ -13,6 +13,8 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 
+#include "mlir/Bytecode/BytecodeOpInterface.h"
+
 #define GET_OP_CLASSES
 #include "PTOOps.h.inc"
 
