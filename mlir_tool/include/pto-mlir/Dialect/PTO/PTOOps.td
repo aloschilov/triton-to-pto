@@ -9,6 +9,7 @@
 include "mlir/IR/OpBase.td"
 include "mlir/IR/DialectBase.td"
 include "mlir/IR/AttrTypeBase.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
 
 //===----------------------------------------------------------------------===//
 // PTO Dialect (aligns with PTOAS)
@@ -130,47 +131,58 @@ def PTO_TileBufType : TypeDef<PTO_Dialect, "TileBuf"> {
 }
 
 //===----------------------------------------------------------------------===//
-// Infrastructure ops (PTOAS-style)
+// Infrastructure ops (PTOAS-aligned)
 //===----------------------------------------------------------------------===//
 
-def PTOMakeTensorViewOp : Op<PTO_Dialect, "make_tensor_view"> {
-  let summary = "Create a tensor view over a pointer (2D)";
+def PTOGetBlockIdxOp : Op<PTO_Dialect, "get_block_idx", [Pure]> {
+  let summary = "Get the current block index (core ID).";
   let description = [{
-    Wraps a pointer into a logical tensor view with given shape and strides.
+    Returns the linear index of the current compute unit (CUBE Core) within
+    the task. The return value is in the range [0, BlockNum - 1].
+  }];
+  let arguments = (ins);
+  let results = (outs I64:$result);
+  let assemblyFormat = "attr-dict";
+}
+
+def PTOMakeTensorViewOp : Op<PTO_Dialect, "make_tensor_view", [AttrSizedOperandSegments]> {
+  let summary = "Wrap a pointer as a tensor_view descriptor (PTOAS-aligned)";
+  let description = [{
+    Creates a logical tensor view over a pointer with given shape and strides.
+    Uses variadic shape/strides to support arbitrary rank.
   }];
 
   let arguments = (ins
     PTO_PtrType:$ptr,
-    Index:$rows,
-    Index:$cols,
-    Index:$stride_row,
-    Index:$stride_col
+    Variadic<Index>:$shape,
+    Variadic<Index>:$strides
   );
-  let results = (outs
-    PTO_TensorViewType:$result
-  );
+  let results = (outs PTO_TensorViewType:$result);
 
-  let assemblyFormat = "$ptr `,` $rows `,` $cols `,` $stride_row `,` $stride_col attr-dict `:` type($ptr) `->` type($result)";
+  let assemblyFormat = [{
+    $ptr `,` `shape` `=` `[` $shape `]` `strides` `=` `[` $strides `]`
+    attr-dict `:` type($ptr) `->` qualified(type($result))
+  }];
 }
 
-def PTOPartitionViewOp : Op<PTO_Dialect, "partition_view"> {
-  let summary = "Create a partition (slice) of a tensor view (2D)";
+def PTOPartitionViewOp : Op<PTO_Dialect, "partition_view", [AttrSizedOperandSegments]> {
+  let summary = "Partition a tensor view into a logical slice (PTOAS-aligned)";
   let description = [{
-    Creates a logical partition from a tensor view with given offsets and sizes.
+    Captures a specific calculation region from a large view.
+    Carries offsets (where to read) and sizes (how much to read).
   }];
 
   let arguments = (ins
     PTO_TensorViewType:$source,
-    Index:$offset_row,
-    Index:$offset_col,
-    Index:$size_row,
-    Index:$size_col
+    Variadic<Index>:$offsets,
+    Variadic<Index>:$sizes
   );
-  let results = (outs
-    PTO_PartitionTensorViewType:$result
-  );
+  let results = (outs PTO_PartitionTensorViewType:$result);
 
-  let assemblyFormat = "$source `,` $offset_row `,` $offset_col `,` $size_row `,` $size_col attr-dict `:` qualified(type($source)) `->` type($result)";
+  let assemblyFormat = [{
+    $source `,` `offsets` `=` `[` $offsets `]` `,` `sizes` `=` `[` $sizes `]`
+    attr-dict `:` qualified(type($source)) `->` qualified(type($result))
+  }];
 }
 
 def PTOAllocTileOp : Op<PTO_Dialect, "alloc_tile"> {
@@ -187,20 +199,8 @@ def PTOAllocTileOp : Op<PTO_Dialect, "alloc_tile"> {
   let assemblyFormat = "attr-dict `:` type($result)";
 }
 
-def PTOConstantTileOp : Op<PTO_Dialect, "constant_tile"> {
-  let summary = "Constant tile (splat value)";
-  let description = [{
-    Produces a tile buffer filled with a constant splat value.
-  }];
-
-  let arguments = (ins ElementsAttr:$value);
-  let results = (outs PTO_TileBufType:$result);
-
-  let assemblyFormat = "$value attr-dict `:` type($result)";
-}
-
 //===----------------------------------------------------------------------===//
-// Core Ops (DPS format: ins/outs)
+// Core Ops (DPS format: ins/outs, PTOAS-aligned)
 //===----------------------------------------------------------------------===//
 
 def PTOTLoadOp : Op<PTO_Dialect, "tload"> {
@@ -264,36 +264,71 @@ def PTOTAddOp : Op<PTO_Dialect, "tadd"> {
   let assemblyFormat = "`ins` `(` $lhs `:` type($lhs) `,` $rhs `:` type($rhs) `)` `outs` `(` $dst `:` type($dst) `)` attr-dict";
 }
 
-def PTOTReduceSumOp : Op<PTO_Dialect, "treduce_sum"> {
-  let summary = "PTO tile reduction (sum)";
+def PTOTExpandsOp : Op<PTO_Dialect, "texpands"> {
+  let summary = "Broadcast scalar into tile (DPS)";
   let description = [{
-    Reduce all elements of a tile to a scalar sum.
+    Fills every element of the destination tile buffer with the given scalar.
   }];
-
-  let arguments = (ins
-    AnyType:$tile
-  );
-  let results = (outs
-    AnyType:$result
-  );
-
-  let assemblyFormat = "$tile attr-dict `:` type($tile) `->` type($result)";
+  let arguments = (ins AnyType:$scalar, PTO_TileBufType:$dst);
+  let results = (outs);
+  let assemblyFormat = [{
+    `ins` `(` $scalar `:` type($scalar) `)`
+    `outs` `(` $dst `:` qualified(type($dst)) `)` attr-dict
+  }];
 }
 
-def PTOSStoreOp : Op<PTO_Dialect, "sstore"> {
-  let summary = "PTO scalar store to memref element";
+def PTOTRowSumOp : Op<PTO_Dialect, "trowsum"> {
+  let summary = "Reduce each row by summing across columns (DPS)";
   let description = [{
-    Store a single scalar value into a memref element at [row, col].
+    For each row i: dst[i,0] = sum_j src[i,j]. Requires a tmp tile (same shape
+    as src) for intermediate storage.
   }];
-
-  let arguments = (ins
-    AnyType:$value,
-    AnyType:$memref,
-    Index:$row,
-    Index:$col
-  );
+  let arguments = (ins PTO_TileBufType:$src, PTO_TileBufType:$tmp, PTO_TileBufType:$dst);
   let results = (outs);
+  let assemblyFormat = [{
+    `ins` `(` $src `,` $tmp `:` qualified(type($src)) `,` qualified(type($tmp)) `)`
+    `outs` `(` $dst `:` qualified(type($dst)) `)` attr-dict
+  }];
+}
 
-  let assemblyFormat = "$value `,` $memref `[` $row `,` $col `]` attr-dict `:` type($value) `,` type($memref)";
+def PTOTColSumOp : Op<PTO_Dialect, "tcolsum"> {
+  let summary = "Reduce each column by summing across rows (DPS)";
+  let description = [{
+    For each col j: dst[0,j] = sum_i src[i,j]. Requires a tmp tile for
+    intermediate storage.
+  }];
+  let arguments = (ins PTO_TileBufType:$src, PTO_TileBufType:$tmp, PTO_TileBufType:$dst);
+  let results = (outs);
+  let assemblyFormat = [{
+    `ins` `(` $src `,` $tmp `:` qualified(type($src)) `,` qualified(type($tmp)) `)`
+    `outs` `(` $dst `:` qualified(type($dst)) `)` attr-dict
+  }];
+}
+
+def PTOTGetValOp : Op<PTO_Dialect, "tgetval"> {
+  let summary = "Read scalar from tile at offset";
+  let description = [{
+    Reads a single element from tile-like src at the given linear offset.
+  }];
+  let arguments = (ins PTO_TileBufType:$src, Index:$offset);
+  let results = (outs AnyType:$dst);
+  let assemblyFormat = [{
+    `ins` `(` $src `,` $offset `:` qualified(type($src)) `,` type($offset) `)`
+    `outs` `:` type($dst) attr-dict
+  }];
+}
+
+def PTOTSetValOp : Op<PTO_Dialect, "tsetval"> {
+  let summary = "Write scalar into tile at offset (DPS)";
+  let description = [{
+    Writes a scalar value into a single element of dst at the given linear
+    offset.
+  }];
+  let arguments = (ins PTO_TileBufType:$dst, Index:$offset, AnyType:$val);
+  let results = (outs);
+  let assemblyFormat = [{
+    `ins` `(` $offset `,` $val `:` type($offset) `,` type($val) `)`
+    `outs` `(` $dst `:` qualified(type($dst)) `)` attr-dict
+  }];
 }
 

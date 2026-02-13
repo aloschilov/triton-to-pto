@@ -24,7 +24,8 @@ module {
 // CHECK-LABEL: func.func @accumulate_kernel
 // CHECK-SAME: %arg0: !pto.ptr<f32>
 // CHECK-SAME: %arg1: i32)
-// CHECK: pto.constant_tile
+// CHECK: pto.alloc_tile
+// CHECK: pto.texpands ins({{.*}}) outs({{.*}})
 // CHECK: scf.for {{.*}} iter_args({{.*}} = {{.*}}) -> (!pto.tile_buf<
 // CHECK:   pto.alloc_tile
 // CHECK:   pto.tadd ins(

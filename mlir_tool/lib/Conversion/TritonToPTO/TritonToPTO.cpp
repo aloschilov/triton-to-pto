@@ -375,14 +375,19 @@ struct ConvertTTLoadOp : public OpConversionPattern<LoadOp> {
         loc, rewriter.getIntegerAttr(indexType, cols));
     Value c1 = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getIntegerAttr(indexType, 1));
+    // PTOAS-aligned: variadic shape/strides keyword syntax
     auto tensorViewType = pto::TensorViewType::get(
         rewriter.getContext(), {rows, cols}, tileBufType.getElementType());
+    SmallVector<Value> shape = {cRows, cCols};
+    SmallVector<Value> strides = {cCols, c1};
     Value tv = rewriter.create<pto::PTOMakeTensorViewOp>(
-        loc, tensorViewType, ptr, cRows, cCols, cCols, c1);
+        loc, tensorViewType, ptr, shape, strides);
     auto partType = pto::PartitionTensorViewType::get(
         rewriter.getContext(), {rows, cols}, tileBufType.getElementType());
+    SmallVector<Value> offsets = {c0, c0};
+    SmallVector<Value> sizes = {cRows, cCols};
     Value pv = rewriter.create<pto::PTOPartitionViewOp>(
-        loc, partType, tv, c0, c0, cRows, cCols);
+        loc, partType, tv, offsets, sizes);
     Value tile = rewriter.create<pto::PTOAllocTileOp>(loc, tileBufType);
     rewriter.create<pto::PTOTLoadOp>(loc, pv, tile);
     rewriter.replaceOp(op, tile);
@@ -425,7 +430,35 @@ struct ConvertTTReduceOp : public ConversionPattern {
     if (!resultType.isF32())
       return rewriter.notifyMatchFailure(op, "expected f32 reduce result");
 
-    rewriter.replaceOpWithNewOp<pto::PTOTReduceSumOp>(op, resultType, tile);
+    auto tileBufType = llvm::dyn_cast<pto::TileBufType>(tile.getType());
+    if (!tileBufType)
+      return rewriter.notifyMatchFailure(op, "expected tile_buf operand");
+
+    Location loc = op->getLoc();
+    MLIRContext *ctx = rewriter.getContext();
+    Type indexType = rewriter.getIndexType();
+    Type elemType = tileBufType.getElementType();
+    int64_t rows = tileBufType.getDimSize(0);
+    int64_t cols = tileBufType.getDimSize(1);
+
+    // 1. trowsum: RxC -> Rx1 (sum across columns for each row)
+    auto rowResultType = pto::TileBufType::get(ctx, {rows, 1}, elemType);
+    Value rsTmp = rewriter.create<pto::PTOAllocTileOp>(loc, tileBufType);
+    Value rsDst = rewriter.create<pto::PTOAllocTileOp>(loc, rowResultType);
+    rewriter.create<pto::PTOTRowSumOp>(loc, tile, rsTmp, rsDst);
+
+    // 2. tcolsum: Rx1 -> 1x1 (sum across rows)
+    auto scalarTileType = pto::TileBufType::get(ctx, {1, 1}, elemType);
+    Value csTmp = rewriter.create<pto::PTOAllocTileOp>(loc, rowResultType);
+    Value csDst = rewriter.create<pto::PTOAllocTileOp>(loc, scalarTileType);
+    rewriter.create<pto::PTOTColSumOp>(loc, rsDst, csTmp, csDst);
+
+    // 3. tgetval: extract scalar from 1x1 tile at offset 0
+    Value c0_idx = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getIntegerAttr(indexType, 0));
+    Value scalar =
+        rewriter.create<pto::PTOTGetValOp>(loc, resultType, csDst, c0_idx);
+    rewriter.replaceOp(op, scalar);
     return success();
   }
 };
@@ -451,11 +484,15 @@ struct ConvertTTStoreOp : public ConversionPattern {
       return rewriter.notifyMatchFailure(op, "could not resolve func arg");
     Value value = operands[1];
     Location loc = op->getLoc();
+    MLIRContext *ctx = rewriter.getContext();
     Type indexType = rewriter.getIndexType();
     Value c0 = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getIntegerAttr(indexType, 0));
+    Value c1 = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getIntegerAttr(indexType, 1));
 
     if (llvm::isa<RankedTensorType>(origVal.getType())) {
+      // Tensor store: make_tensor_view + partition_view + tstore
       auto tileBufType = llvm::dyn_cast<pto::TileBufType>(value.getType());
       if (!tileBufType)
         return rewriter.notifyMatchFailure(op, "expected tile buffer type");
@@ -465,24 +502,53 @@ struct ConvertTTStoreOp : public ConversionPattern {
           loc, rewriter.getIntegerAttr(indexType, rows));
       Value cCols = rewriter.create<arith::ConstantOp>(
           loc, rewriter.getIntegerAttr(indexType, cols));
-      Value c1 = rewriter.create<arith::ConstantOp>(
-          loc, rewriter.getIntegerAttr(indexType, 1));
+      // PTOAS-aligned: variadic shape/strides keyword syntax
       auto tensorViewType = pto::TensorViewType::get(
-          rewriter.getContext(), {rows, cols}, tileBufType.getElementType());
+          ctx, {rows, cols}, tileBufType.getElementType());
+      SmallVector<Value> shape = {cRows, cCols};
+      SmallVector<Value> strides = {cCols, c1};
       Value tv = rewriter.create<pto::PTOMakeTensorViewOp>(
-          loc, tensorViewType, ptr, cRows, cCols, cCols, c1);
+          loc, tensorViewType, ptr, shape, strides);
       auto partType = pto::PartitionTensorViewType::get(
-          rewriter.getContext(), {rows, cols}, tileBufType.getElementType());
+          ctx, {rows, cols}, tileBufType.getElementType());
+      SmallVector<Value> offsets = {c0, c0};
+      SmallVector<Value> sizes = {cRows, cCols};
       Value pv = rewriter.create<pto::PTOPartitionViewOp>(
-          loc, partType, tv, c0, c0, cRows, cCols);
+          loc, partType, tv, offsets, sizes);
       rewriter.create<pto::PTOTStoreOp>(loc, value, pv);
     } else {
+      // Scalar store: PTOAS-aligned make_tensor_view + partition_view +
+      //               alloc_tile(1x1) + tsetval + tstore
       std::optional<ScalarStoreIndices> indices =
           getScalarStoreIndices(origPtr, op, rewriter);
       if (!indices)
-        return rewriter.notifyMatchFailure(op, "could not get scalar store indices");
-      rewriter.create<pto::PTOSStoreOp>(loc, value, indices->basePtr,
-                                        indices->row, indices->col);
+        return rewriter.notifyMatchFailure(op,
+                                           "could not get scalar store indices");
+      Type elemType = value.getType();
+      auto scalarTileType = pto::TileBufType::get(ctx, {1, 1}, elemType);
+      auto tvType = pto::TensorViewType::get(
+          ctx, {ShapedType::kDynamic, ShapedType::kDynamic}, elemType);
+      auto pvType =
+          pto::PartitionTensorViewType::get(ctx, {1, 1}, elemType);
+
+      // tensor_view over base pointer; shape = [row+1, 1] to be large enough
+      Value rowPlus1 =
+          rewriter.create<arith::AddIOp>(loc, indices->row, c1);
+      SmallVector<Value> tvShape = {rowPlus1, c1};
+      SmallVector<Value> tvStrides = {c1, c1};
+      Value tv = rewriter.create<pto::PTOMakeTensorViewOp>(
+          loc, tvType, indices->basePtr, tvShape, tvStrides);
+
+      // partition_view at [row, 0] with size [1, 1]
+      SmallVector<Value> pvOffsets = {indices->row, c0};
+      SmallVector<Value> pvSizes = {c1, c1};
+      Value pv = rewriter.create<pto::PTOPartitionViewOp>(
+          loc, pvType, tv, pvOffsets, pvSizes);
+
+      // alloc 1x1 tile, set scalar value at offset 0, then tstore
+      Value tile = rewriter.create<pto::PTOAllocTileOp>(loc, scalarTileType);
+      rewriter.create<pto::PTOTSetValOp>(loc, tile, c0, value);
+      rewriter.create<pto::PTOTStoreOp>(loc, tile, pv);
     }
     rewriter.eraseOp(op);
     return success();
@@ -492,7 +558,7 @@ struct ConvertTTStoreOp : public ConversionPattern {
 // scf.for / scf.yield type conversion is handled by the built-in
 // populateSCFStructuralTypeConversionsAndLegality() from MLIRSCFTransforms.
 
-// Convert tensor-typed arith.constant to pto.constant_tile (splat).
+// Convert tensor-typed arith.constant to alloc_tile + texpands (PTOAS-aligned).
 struct ConvertArithConstantOp : public OpConversionPattern<arith::ConstantOp> {
   ConvertArithConstantOp(TypeConverter &typeConverter, PatternBenefit benefit,
                          MLIRContext *ctx)
@@ -511,8 +577,34 @@ struct ConvertArithConstantOp : public OpConversionPattern<arith::ConstantOp> {
     auto dense = llvm::dyn_cast<DenseElementsAttr>(op.getValue());
     if (!dense || !dense.isSplat())
       return rewriter.notifyMatchFailure(op, "constant must be splat");
-    rewriter.replaceOpWithNewOp<pto::PTOConstantTileOp>(
-        op, tileBufType, llvm::cast<ElementsAttr>(op.getValue()));
+    Location loc = op.getLoc();
+    // Create scalar constant from the splat value
+    auto splatAttr = llvm::cast<TypedAttr>(dense.getSplatValue<Attribute>());
+    Value scalar = rewriter.create<arith::ConstantOp>(loc, splatAttr);
+    // Allocate destination tile and broadcast scalar into it
+    Value tile = rewriter.create<pto::PTOAllocTileOp>(loc, tileBufType);
+    rewriter.create<pto::PTOTExpandsOp>(loc, scalar, tile);
+    rewriter.replaceOp(op, tile);
+    return success();
+  }
+};
+
+// Convert tt.get_program_id -> pto.get_block_idx (PTOAS-aligned).
+struct ConvertTTGetProgramIdOp
+    : public OpConversionPattern<GetProgramIdOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(GetProgramIdOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    // pto.get_block_idx returns i64
+    Value pid64 =
+        rewriter.create<pto::PTOGetBlockIdxOp>(loc, rewriter.getI64Type());
+    // Triton get_program_id returns i32 -- truncate
+    Value pid32 =
+        rewriter.create<arith::TruncIOp>(loc, rewriter.getI32Type(), pid64);
+    rewriter.replaceOp(op, pid32);
     return success();
   }
 };
@@ -613,7 +705,8 @@ struct TritonToPTO : public PassWrapper<TritonToPTO, OperationPass<ModuleOp>> {
     patterns.add<ConvertTTReduceOp>(typeConverter, &getContext());
     patterns.add<ConvertArithConstantOp>(typeConverter, /*benefit=*/2,
                                          &getContext());
-    patterns.add<EraseTritonOp<GetProgramIdOp>, EraseTritonOp<MakeRangeOp>,
+    patterns.add<ConvertTTGetProgramIdOp>(typeConverter, &getContext());
+    patterns.add<EraseTritonOp<MakeRangeOp>,
                  EraseTritonOp<SplatOp>, EraseTritonOp<AddPtrOp>>(
         typeConverter, &getContext());
     patterns.add<EraseArithMuliOp, EraseArithAddIOp, EraseArithCmpiOp>(
@@ -623,7 +716,10 @@ struct TritonToPTO : public PassWrapper<TritonToPTO, OperationPass<ModuleOp>> {
     target.addLegalDialect<pto::PTODialect, func::FuncDialect,
                            arith::ArithDialect>();
     target.addIllegalDialect<triton::TritonDialect>();
-    target.addIllegalOp<arith::MulIOp>(); // Erased by EraseArithMuliOp
+    // arith.muli: legal for scalars (e.g. pid * block_size), illegal for tensors
+    target.addDynamicallyLegalOp<arith::MulIOp>([](arith::MulIOp op) {
+      return !llvm::isa<RankedTensorType>(op.getResult().getType());
+    });
     target.addDynamicallyLegalOp<arith::ConstantOp>([](arith::ConstantOp op) {
       return std::optional<bool>(
           !llvm::isa<RankedTensorType>(op.getResult().getType()));

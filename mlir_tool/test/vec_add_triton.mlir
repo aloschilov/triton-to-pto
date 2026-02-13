@@ -43,16 +43,18 @@ module {
 // CHECK-SAME: %arg1: !pto.ptr<f32>
 // CHECK-SAME: %arg2: !pto.ptr<f32>
 // CHECK-SAME: %arg3: i32)
-// CHECK-DAG: arith.constant 0 : index
-// CHECK: pto.make_tensor_view %arg0
-// CHECK: pto.partition_view
+// CHECK: pto.get_block_idx
+// CHECK: arith.trunci {{.*}} : i64 to i32
+// CHECK: arith.muli {{.*}} : i32
+// CHECK: pto.make_tensor_view %arg0, shape = [{{.*}}] strides = [{{.*}}]
+// CHECK: pto.partition_view {{.*}}, offsets = [{{.*}}], sizes = [{{.*}}]
 // CHECK: pto.alloc_tile
 // CHECK: pto.tload ins({{.*}}) outs({{.*}})
-// CHECK: pto.make_tensor_view %arg1
+// CHECK: pto.make_tensor_view %arg1, shape = [{{.*}}] strides = [{{.*}}]
 // CHECK: pto.tload ins({{.*}}) outs({{.*}})
 // CHECK: pto.alloc_tile
-// CHECK: pto.tadd ins({{.*}}, {{.*}}) outs({{.*}})
-// CHECK: pto.make_tensor_view %arg2
+// CHECK: pto.tadd ins({{.*}}) outs({{.*}})
+// CHECK: pto.make_tensor_view %arg2, shape = [{{.*}}] strides = [{{.*}}]
 // CHECK: pto.tstore ins({{.*}}) outs({{.*}})
 // CHECK: return
 // CHECK-NOT: tt.

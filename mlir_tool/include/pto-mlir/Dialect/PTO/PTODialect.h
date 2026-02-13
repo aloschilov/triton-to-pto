@@ -8,6 +8,7 @@
 #define PTO_MLIR_DIALECT_PTO_PTODIALECT_H
 
 #include "mlir/IR/Dialect.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 namespace pto {
 

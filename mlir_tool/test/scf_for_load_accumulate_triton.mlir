@@ -35,9 +35,13 @@ module {
 // CHECK-LABEL: func.func @load_accumulate_kernel
 // CHECK-SAME: %arg0: !pto.ptr<f32>
 // CHECK-SAME: %arg1: i32)
-// CHECK: pto.constant_tile
+// CHECK: pto.get_block_idx
+// CHECK: arith.trunci {{.*}} : i64 to i32
+// CHECK: arith.muli {{.*}} : i32
+// CHECK: pto.alloc_tile
+// CHECK: pto.texpands ins({{.*}}) outs({{.*}})
 // CHECK: scf.for {{.*}} iter_args({{.*}} = {{.*}}) -> (!pto.tile_buf<
-// CHECK:   pto.make_tensor_view
+// CHECK:   pto.make_tensor_view {{.*}}, shape = [{{.*}}] strides = [{{.*}}]
 // CHECK:   pto.tload
 // CHECK:   pto.tadd
 // CHECK:   scf.yield
