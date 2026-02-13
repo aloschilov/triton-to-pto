@@ -18,7 +18,6 @@
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/OperationSupport.h"
 #include "pto-mlir/Dialect/PTO/PTODialect.h"
-#include "pto-mlir/Dialect/PTO/PTOTypes.h"
 #define GET_OP_CLASSES
 #include "PTOOps.h.inc"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -86,9 +85,7 @@ public:
         Type elem = ptrType.getPointeeType();
         if (!elem.isIntOrFloat() && !isa<RankedTensorType>(elem))
           elem = Float32Type::get(type.getContext());
-        auto [rows, cols] = computeTileShape(blockSize, elem);
-        SmallVector<int64_t, 5> memrefShape = {1, 1, 1, rows, cols};
-        return pto::PTOMemRefType::get(type.getContext(), memrefShape, elem);
+        return pto::PtrType::get(type.getContext(), elem);
       }
       if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
         if (tensorType.getRank() != 1)
@@ -98,9 +95,9 @@ public:
           return std::nullopt;
         Type elem = tensorType.getElementType();
         auto [rows, cols] = computeTileShape(n, elem);
-        return pto::PTOTileType::get(type.getContext(), {rows, cols}, elem);
+        return pto::TileBufType::get(type.getContext(), {rows, cols}, elem);
       }
-      if (type.isIntOrIndex())
+      if (type.isIntOrIndex() || llvm::isa<FloatType>(type))
         return type;
       return std::nullopt;
     });
@@ -112,7 +109,7 @@ public:
         return std::nullopt;
       Type elem = type.getElementType();
       auto [rows, cols] = computeTileShape(n, elem);
-      return pto::PTOTileType::get(type.getContext(), {rows, cols}, elem);
+      return pto::TileBufType::get(type.getContext(), {rows, cols}, elem);
     });
   }
 
@@ -130,6 +127,70 @@ static BlockArgument traceBasePointer(Value v) {
   return dyn_cast<BlockArgument>(v);
 }
 
+// Classify pointer block arguments of a Triton function as scalar outputs vs.
+// tile-backed pointers based on their uses. A pointer that ever participates
+// in a tensor-based load/store (via splat/addptr chains) is treated as
+// tile-sized; remaining pointer args are treated as scalar outputs.
+static llvm::SmallDenseSet<unsigned>
+classifyScalarPointerArgs(triton::FuncOp func) {
+  llvm::SmallDenseSet<unsigned> pointerArgs;
+  llvm::SmallDenseSet<unsigned> tilePointerArgs;
+
+  Block &entryBlock = func.getBody().front();
+  for (auto it : llvm::enumerate(entryBlock.getArguments())) {
+    unsigned index = it.index();
+    BlockArgument arg = it.value();
+    if (!llvm::isa<triton::PointerType>(arg.getType()))
+      continue;
+    pointerArgs.insert(index);
+
+    // Worklist over values derived from this pointer argument.
+    SmallVector<Value, 8> worklist;
+    llvm::SmallPtrSet<Value, 8> visited;
+    worklist.push_back(arg);
+
+    while (!worklist.empty()) {
+      Value v = worklist.pop_back_val();
+      if (!visited.insert(v).second)
+        continue;
+
+      for (Operation *user : v.getUsers()) {
+        if (auto splat = dyn_cast<SplatOp>(user)) {
+          // Pointer is being broadcast into a tensor of pointers -> tile-backed.
+          tilePointerArgs.insert(index);
+          worklist.push_back(splat.getResult());
+          continue;
+        }
+        if (auto addPtr = dyn_cast<AddPtrOp>(user)) {
+          if (addPtr.getPtr() == v)
+            worklist.push_back(addPtr.getResult());
+          continue;
+        }
+        if (auto load = dyn_cast<LoadOp>(user)) {
+          if (load.getPtr() == v)
+            tilePointerArgs.insert(index);
+          continue;
+        }
+        if (auto store = dyn_cast<StoreOp>(user)) {
+          // If this pointer eventually feeds a tensor-valued store, treat as tile.
+          if (store.getPtr() == v) {
+            if (llvm::isa<RankedTensorType>(store.getValue().getType()))
+              tilePointerArgs.insert(index);
+          }
+          continue;
+        }
+      }
+    }
+  }
+
+  llvm::SmallDenseSet<unsigned> scalarPointerArgs;
+  for (unsigned idx : pointerArgs) {
+    if (!tilePointerArgs.contains(idx))
+      scalarPointerArgs.insert(idx);
+  }
+  return scalarPointerArgs;
+}
+
 //--- Conversion patterns -----------------------------------------------------
 
 struct ConvertTTFuncOp : public OpConversionPattern<triton::FuncOp> {
@@ -141,7 +202,27 @@ struct ConvertTTFuncOp : public OpConversionPattern<triton::FuncOp> {
     const TypeConverter *conv = getTypeConverter();
     FunctionType fnType = op.getFunctionType();
     SmallVector<Type, 4> newArgTypes;
-    for (Type t : fnType.getInputs()) {
+    // Classify pointer arguments that should become 1x1x1x1x1 scalar-output
+    // memrefs instead of block-sized tiles.
+    llvm::SmallDenseSet<unsigned> scalarPointerArgs =
+        classifyScalarPointerArgs(op);
+
+    for (auto it : llvm::enumerate(fnType.getInputs())) {
+      unsigned index = it.index();
+      Type t = it.value();
+
+      // For scalar-output pointer arguments, bypass the generic type
+      // converter and materialize a 1x1x1x1x1 memref directly.
+      if (auto ptrType = dyn_cast<triton::PointerType>(t)) {
+        if (scalarPointerArgs.contains(index)) {
+          Type elem = ptrType.getPointeeType();
+          if (!elem.isIntOrFloat() && !isa<RankedTensorType>(elem))
+            elem = Float32Type::get(t.getContext());
+          newArgTypes.push_back(pto::PtrType::get(t.getContext(), elem));
+          continue;
+        }
+      }
+
       Type c = conv->convertType(t);
       if (!c) {
         if (t.isIntOrIndex())
@@ -197,15 +278,34 @@ struct ConvertTTLoadOp : public OpConversionPattern<LoadOp> {
     if (!baseArg)
       return rewriter.notifyMatchFailure(op, "could not trace base pointer");
     const TypeConverter *conv = getTypeConverter();
-    Value memref = op->getBlock()->getArgument(baseArg.getArgNumber());
-    Type tileType = conv->convertType(op.getType());
-    if (!tileType)
+    Value ptr = op->getBlock()->getArgument(baseArg.getArgNumber());
+    auto tileBufType = llvm::dyn_cast_or_null<pto::TileBufType>(
+        conv->convertType(op.getType()));
+    if (!tileBufType)
       return rewriter.notifyMatchFailure(op, "unsupported result type");
+    int64_t rows = tileBufType.getDimSize(0);
+    int64_t cols = tileBufType.getDimSize(1);
     Location loc = op.getLoc();
     Type indexType = rewriter.getIndexType();
     Value c0 = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getIntegerAttr(indexType, 0));
-    rewriter.replaceOpWithNewOp<pto::PTOTLoadOp>(op, tileType, memref, c0, c0);
+    Value cRows = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getIntegerAttr(indexType, rows));
+    Value cCols = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getIntegerAttr(indexType, cols));
+    Value c1 = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getIntegerAttr(indexType, 1));
+    auto tensorViewType = pto::TensorViewType::get(
+        rewriter.getContext(), {rows, cols}, tileBufType.getElementType());
+    Value tv = rewriter.create<pto::PTOMakeTensorViewOp>(
+        loc, tensorViewType, ptr, cRows, cCols, cCols, c1);
+    auto partType = pto::PartitionTensorViewType::get(
+        rewriter.getContext(), {rows, cols}, tileBufType.getElementType());
+    Value pv = rewriter.create<pto::PTOPartitionViewOp>(
+        loc, partType, tv, c0, c0, cRows, cCols);
+    Value tile = rewriter.create<pto::PTOAllocTileOp>(loc, tileBufType);
+    rewriter.create<pto::PTOTLoadOp>(loc, pv, tile);
+    rewriter.replaceOp(op, tile);
     return success();
   }
 };
@@ -217,30 +317,87 @@ struct ConvertArithAddFOp : public OpConversionPattern<arith::AddFOp> {
   matchAndRewrite(arith::AddFOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Type resType = getTypeConverter()->convertType(op.getType());
-    if (!resType || !llvm::isa<pto::PTOTileType>(resType))
-      return rewriter.notifyMatchFailure(op, "not a tile type");
-    rewriter.replaceOpWithNewOp<pto::PTOTAddOp>(
-        op, resType, adaptor.getLhs(), adaptor.getRhs());
+    auto tileBufType = llvm::dyn_cast<pto::TileBufType>(resType);
+    if (!tileBufType)
+      return rewriter.notifyMatchFailure(op, "not a tile buffer type");
+    Value dst = rewriter.create<pto::PTOAllocTileOp>(op.getLoc(), tileBufType);
+    rewriter.create<pto::PTOTAddOp>(op.getLoc(), adaptor.getLhs(),
+                                    adaptor.getRhs(), dst);
+    rewriter.replaceOp(op, dst);
     return success();
   }
 };
 
-struct ConvertTTStoreOp : public OpConversionPattern<StoreOp> {
-  using OpConversionPattern::OpConversionPattern;
+struct ConvertTTReduceOp : public ConversionPattern {
+  ConvertTTReduceOp(TypeConverter &typeConverter, MLIRContext *ctx)
+      : ConversionPattern(typeConverter, "tt.reduce",
+                          /*benefit=*/1, ctx) {}
 
   LogicalResult
-  matchAndRewrite(StoreOp op, OpAdaptor adaptor,
+  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
                   ConversionPatternRewriter &rewriter) const override {
-    BlockArgument baseArg = traceBasePointer(op.getPtr());
+    // Expect a single tile operand and a single scalar result.
+    if (op->getNumOperands() != 1 || op->getNumResults() != 1)
+      return rewriter.notifyMatchFailure(op, "unsupported tt.reduce shape");
+
+    Value tile = operands.front();
+    Type resultType = op->getResult(0).getType();
+    if (!resultType.isF32())
+      return rewriter.notifyMatchFailure(op, "expected f32 reduce result");
+
+    rewriter.replaceOpWithNewOp<pto::PTOTReduceSumOp>(op, resultType, tile);
+    return success();
+  }
+};
+
+struct ConvertTTStoreOp : public ConversionPattern {
+  ConvertTTStoreOp(TypeConverter &typeConverter, MLIRContext *ctx)
+      : ConversionPattern(typeConverter, "tt.store", /*benefit=*/1, ctx) {}
+
+  LogicalResult
+  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (operands.size() < 2)
+      return rewriter.notifyMatchFailure(op, "expected ptr and value operands");
+
+    Value origPtr = op->getOperand(0);
+    Value origVal = op->getOperand(1);
+    BlockArgument baseArg = traceBasePointer(origPtr);
     if (!baseArg)
       return rewriter.notifyMatchFailure(op, "could not trace base pointer");
-    Value tile = adaptor.getValue();
-    Value memref = op->getBlock()->getArgument(baseArg.getArgNumber());
-    Location loc = op.getLoc();
+
+    Value ptr = op->getBlock()->getArgument(baseArg.getArgNumber());
+    Value value = operands[1];
+    Location loc = op->getLoc();
     Type indexType = rewriter.getIndexType();
     Value c0 = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getIntegerAttr(indexType, 0));
-    rewriter.replaceOpWithNewOp<pto::PTOTStoreOp>(op, tile, memref, c0, c0);
+
+    if (llvm::isa<RankedTensorType>(origVal.getType())) {
+      auto tileBufType = llvm::dyn_cast<pto::TileBufType>(value.getType());
+      if (!tileBufType)
+        return rewriter.notifyMatchFailure(op, "expected tile buffer type");
+      int64_t rows = tileBufType.getDimSize(0);
+      int64_t cols = tileBufType.getDimSize(1);
+      Value cRows = rewriter.create<arith::ConstantOp>(
+          loc, rewriter.getIntegerAttr(indexType, rows));
+      Value cCols = rewriter.create<arith::ConstantOp>(
+          loc, rewriter.getIntegerAttr(indexType, cols));
+      Value c1 = rewriter.create<arith::ConstantOp>(
+          loc, rewriter.getIntegerAttr(indexType, 1));
+      auto tensorViewType = pto::TensorViewType::get(
+          rewriter.getContext(), {rows, cols}, tileBufType.getElementType());
+      Value tv = rewriter.create<pto::PTOMakeTensorViewOp>(
+          loc, tensorViewType, ptr, cRows, cCols, cCols, c1);
+      auto partType = pto::PartitionTensorViewType::get(
+          rewriter.getContext(), {rows, cols}, tileBufType.getElementType());
+      Value pv = rewriter.create<pto::PTOPartitionViewOp>(
+          loc, partType, tv, c0, c0, cRows, cCols);
+      rewriter.create<pto::PTOTStoreOp>(loc, value, pv);
+    } else {
+      rewriter.create<pto::PTOSStoreOp>(loc, value, ptr, c0, c0);
+    }
+    rewriter.eraseOp(op);
     return success();
   }
 };
@@ -338,6 +495,7 @@ struct TritonToPTO : public PassWrapper<TritonToPTO, OperationPass<ModuleOp>> {
     patterns.add<ConvertTTFuncOp, ConvertTTReturnOp, ConvertTTLoadOp,
                  ConvertArithAddFOp, ConvertTTStoreOp>(typeConverter,
                                                       &getContext());
+    patterns.add<ConvertTTReduceOp>(typeConverter, &getContext());
     patterns.add<EraseTritonOp<GetProgramIdOp>, EraseTritonOp<MakeRangeOp>,
                  EraseTritonOp<SplatOp>, EraseTritonOp<AddPtrOp>>(
         typeConverter, &getContext());

@@ -3,7 +3,7 @@
 // -----------------------------------------------------------------------------
 // Expected PTO-AS reference (vector add) — see pto-isa docs/grammar/PTO-AS.md,
 // docs/isa/TLOAD.md, TADD.md, TSTORE.md, and docs/machine/abstract-machine.md.
-// Full lowering converts tt.func to func.func with !pto.memref args and
+// Full lowering converts tt.func to func.func with !pto.ptr args and
 // tt.load/arith.addf/tt.store to pto.tload/pto.tadd/pto.tstore with !pto.tile.
 // -----------------------------------------------------------------------------
 //
@@ -39,14 +39,20 @@ module {
 }
 
 // CHECK-LABEL: func.func @add_kernel
-// CHECK: !pto.memref<1x1x1x16x64xf32>
-// CHECK: !pto.memref<1x1x1x16x64xf32>
-// CHECK: !pto.memref<1x1x1x16x64xf32>
-// CHECK: i32)
+// CHECK-SAME: %arg0: !pto.ptr<f32>
+// CHECK-SAME: %arg1: !pto.ptr<f32>
+// CHECK-SAME: %arg2: !pto.ptr<f32>
+// CHECK-SAME: %arg3: i32)
 // CHECK-DAG: arith.constant 0 : index
-// CHECK: pto.tload {{.*}}[{{.*}}, {{.*}}] : !pto.memref<1x1x1x16x64xf32> -> !pto.tile<16x64xf32>
-// CHECK: pto.tload {{.*}}[{{.*}}, {{.*}}] : !pto.memref<1x1x1x16x64xf32> -> !pto.tile<16x64xf32>
-// CHECK: pto.tadd {{.*}} : !pto.tile<16x64xf32>, !pto.tile<16x64xf32> -> !pto.tile<16x64xf32>
-// CHECK: pto.tstore {{.*}} : !pto.tile<16x64xf32>, !pto.memref<1x1x1x16x64xf32>
+// CHECK: pto.make_tensor_view %arg0
+// CHECK: pto.partition_view
+// CHECK: pto.alloc_tile
+// CHECK: pto.tload ins({{.*}}) outs({{.*}})
+// CHECK: pto.make_tensor_view %arg1
+// CHECK: pto.tload ins({{.*}}) outs({{.*}})
+// CHECK: pto.alloc_tile
+// CHECK: pto.tadd ins({{.*}}, {{.*}}) outs({{.*}})
+// CHECK: pto.make_tensor_view %arg2
+// CHECK: pto.tstore ins({{.*}}) outs({{.*}})
 // CHECK: return
 // CHECK-NOT: tt.

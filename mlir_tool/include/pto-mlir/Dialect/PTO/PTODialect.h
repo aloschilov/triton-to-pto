@@ -26,6 +26,10 @@ public:
 
 } // namespace pto
 
+// TableGen type declarations (useDefaultTypePrinterParser handles parse/print)
+#define GET_TYPEDEF_CLASSES
+#include "PTOTypeDefs.h.inc"
+
 // Op declarations (full definitions pulled in via GET_OP_CLASSES in .cpp)
 #include "PTOOps.h.inc"
 
