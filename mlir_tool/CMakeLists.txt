@@ -18,6 +18,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_CXX_EXTENSIONS NO)
 
 find_package(MLIR REQUIRED CONFIG)
+find_package(LLVM REQUIRED CONFIG)
 
 list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
 include(AddLLVM)
@@ -41,24 +42,50 @@ set(TRITON_BUILD_UT OFF CACHE BOOL
 set(TRITON_CODEGEN_BACKENDS "nvidia" CACHE STRING
   "Enable Triton codegen backends (enable 'nvidia' so Triton GPU/NVIDIA dialects are fully generated)")
 
+# Use TRITON_SOURCE_DIR as-is. For LLVM 19, point it to a Triton checkout
+# compatible with LLVM 19 (e.g. a release branch or tag that supports it).
 if (EXISTS "${TRITON_SOURCE_DIR}/CMakeLists.txt")
-  # Build Triton as a subproject into a dedicated binary directory.
   add_subdirectory(${TRITON_SOURCE_DIR} ${CMAKE_BINARY_DIR}/triton)
 else()
   message(FATAL_ERROR
     "TRITON_SOURCE_DIR ('${TRITON_SOURCE_DIR}') does not contain a Triton CMake project. "
-    "Set TRITON_SOURCE_DIR to a valid Triton checkout.")
+    "Set TRITON_SOURCE_DIR to a valid Triton checkout (for LLVM 19, use an LLVM-19-compatible version).")
 endif()
 
 message(STATUS "Found MLIR: ${MLIR_PACKAGE_VERSION}")
 
 include_directories(
+  ${LLVM_INCLUDE_DIRS}
   ${MLIR_INCLUDE_DIRS}
   ${TRITON_SOURCE_DIR}/include
   ${CMAKE_BINARY_DIR}/triton/include
 )
-list(APPEND LLVM_TABLEGEN_FLAGS "-I${MLIR_INCLUDE_DIRS}")
+foreach(_inc ${MLIR_INCLUDE_DIRS})
+  list(APPEND LLVM_TABLEGEN_FLAGS "-I${_inc}")
+endforeach()
 add_definitions(${MLIR_CMAKE_CXX_FLAGS})
+
+# ---- PTOAS: PTO dialect single source of truth ----
+# Option A: PTOAS as subproject (set PTOAS_SOURCE_DIR to PTOAS repo root).
+# Option B: Installed PTOAS (find_package(PTOAS)).
+set(PTOAS_SOURCE_DIR "" CACHE PATH "Path to PTOAS source tree (for in-tree PTO dialect)")
+if(PTOAS_SOURCE_DIR AND EXISTS "${PTOAS_SOURCE_DIR}/CMakeLists.txt")
+  add_subdirectory(${PTOAS_SOURCE_DIR} ${CMAKE_BINARY_DIR}/ptoas)
+  set(PTOIR_TARGET PTOIR)
+  message(STATUS "Using PTOAS dialect from subproject: ${PTOAS_SOURCE_DIR}")
+elseif(PTOAS_SOURCE_DIR)
+  message(FATAL_ERROR "PTOAS_SOURCE_DIR is set but does not contain CMakeLists.txt: ${PTOAS_SOURCE_DIR}")
+else()
+  find_package(PTOAS QUIET CONFIG)
+  if(PTOAS_FOUND)
+    set(PTOIR_TARGET PTOAS::PTOIR)
+    message(STATUS "Using PTOAS dialect from find_package(PTOAS)")
+  else()
+    message(FATAL_ERROR
+      "PTO dialect is provided by PTOAS. Set PTOAS_SOURCE_DIR to the PTOAS repo root, "
+      "or install PTOAS and set PTOAS_DIR to its lib/cmake/PTOAS.")
+  endif()
+endif()
 
 add_subdirectory(lib)
 add_subdirectory(tools)

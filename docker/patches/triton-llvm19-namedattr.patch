@@ -1,0 +1,14 @@
+--- a/lib/Dialect/Triton/IR/DiscardableAttributes.cpp
++++ b/lib/Dialect/Triton/IR/DiscardableAttributes.cpp
+@@ -9,7 +9,8 @@ filterDiscardableAttrs(Operation *op, ArrayRef<StringRef> allowList) {
+   SmallVector<NamedAttribute> propagatedAttrs;
+   for (auto attrName : allowList) {
+     Attribute attr = op->getDiscardableAttr(attrName);
+     if (attr)
+-      propagatedAttrs.emplace_back(attrName, attr);
++      propagatedAttrs.emplace_back(
++          StringAttr::get(op->getContext(), attrName), attr);
+   }
+   return propagatedAttrs;
+ }
+ 

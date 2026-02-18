@@ -29,7 +29,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "pto-mlir/Dialect/PTO/PTODialect.h"
+#include "PTO/IR/PTO.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 using namespace mlir;
@@ -39,7 +39,7 @@ std::unique_ptr<Pass> createTritonToPTOPass();
 
 int main(int argc, char **argv) {
   DialectRegistry registry;
-  registry.insert<pto::PTODialect,
+  registry.insert<mlir::pto::PTODialect,
                   mlir::triton::TritonDialect,
                   mlir::arith::ArithDialect,
                   mlir::func::FuncDialect,
@@ -48,7 +48,7 @@ int main(int argc, char **argv) {
   MLIRContext context(registry);
   context.allowUnregisteredDialects(true);
   context.getOrLoadDialect<mlir::triton::TritonDialect>();
-  context.getOrLoadDialect<pto::PTODialect>();
+  context.getOrLoadDialect<mlir::pto::PTODialect>();
   context.getOrLoadDialect<mlir::arith::ArithDialect>();
   context.getOrLoadDialect<mlir::func::FuncDialect>();
   context.getOrLoadDialect<mlir::scf::SCFDialect>();

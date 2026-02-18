@@ -8,15 +8,20 @@ target_link_libraries(triton-to-pto-mlir
   MLIRPass
   MLIRParser
   MLIRSupport
-  # Triton (tt) dialect and its dependent dialects
   TritonIR
+  TritonGPUIR
+  TritonAnalysis
+  MLIRTensorUtils
+  MLIRTensorTransforms
+  MLIRTransformUtils
+  MLIRDialectUtils
   MLIRArithDialect
   MLIRMathDialect
   MLIRSCFDialect
   MLIRControlFlowDialect
   MLIRFuncDialect
   MLIRTensorDialect
-  PTOMLIRDialect
+  ${PTOIR_TARGET}
   TritonToPTOPass
 )
 

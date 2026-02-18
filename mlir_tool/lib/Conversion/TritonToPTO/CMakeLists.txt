@@ -9,14 +9,12 @@ add_mlir_library(TritonToPTOPass
   MLIRFuncDialect
   MLIRSCFDialect
   MLIRSCFTransforms
-  PTOMLIRDialect
+  ${PTOIR_TARGET}
   TritonIR
 )
 
 target_include_directories(TritonToPTOPass
   PUBLIC
-  ${CMAKE_SOURCE_DIR}/include
-  ${CMAKE_BINARY_DIR}/lib/Dialect/PTO
   ${TRITON_SOURCE_DIR}/include
   ${CMAKE_BINARY_DIR}/triton/include
 )

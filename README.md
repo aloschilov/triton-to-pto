@@ -12,51 +12,78 @@ command-line tool.
 ## Layout
 
 - `mlir_tool/` – standalone CMake/MLIR project:
-  - `CMakeLists.txt` – top-level MLIR project file.
-  - `include/pto-mlir/Dialect/PTO/` – headers/TableGen definitions for the
-    **PTO MLIR dialect**:
-    - `PTOOps.td` – declares a minimal `pto` dialect and a small set of
-      ops (`tload`, `tstore`, `tmatmul`, `tadd`, …).
-    - `PTODialect.h` – C++ declaration of `pto::PTODialect`.
-  - `lib/Dialect/PTO/` – dialect implementation:
-    - `PTODialect.cpp` – registers `PTODialect` with MLIR (currently a
-      very thin shell).
+  - `CMakeLists.txt` – top-level MLIR project file; **depends on PTOAS** for
+    the PTO dialect (see Build below).
+  - **PTO dialect**: provided by **PTOAS** as the single source of truth. This
+    repo does not ship its own PTO TableGen or dialect implementation; it
+    links to PTOAS’s `PTOIR` library and uses PTOAS’s types/ops so that emitted
+    `.pto` is directly consumable by `ptoas`.
   - `lib/Conversion/TritonToPTO/` – **Triton→PTO conversion pass**:
-    - `TritonToPTO.cpp` – a simple name-based pass that rewrites
-      `tt.load`→`pto.tload`, `tt.store`→`pto.tstore`,
-      `tt.dot`→`pto.tmatmul`, `tt.add`→`pto.tadd`.
+    - `TritonToPTO.cpp` – lowers Triton IR to PTO dialect (e.g.
+      `tt.load`→`pto.tload`, `tt.store`→`pto.tstore`, `tt.add`→`pto.tadd`).
   - `tools/triton-to-pto-mlir/` – CLI driver:
     - `triton-to-pto-mlir.cpp` – parses an MLIR module, runs the
       `convert-triton-to-pto` pass, and prints the result.
-  - `test/` – basic MLIR tests:
-    - `vec_add_triton.mlir` – lit/FileCheck test for a simple vector add
-      kernel (Triton `tt.*` ops → `pto.*` ops).
-    - `lit.cfg.py` – lit configuration for `mlir_tool/test/`.
+  - `test/` – lit/FileCheck tests and E2E script:
+    - `vec_add_triton.mlir`, `reduce_sum_triton.mlir`, etc. – lit tests.
+    - `e2e_run_ptoas_sim.sh` – Triton → converter → .pto → PTOAS docker/sim.
 
 ## Prerequisites
 
-- LLVM + MLIR with CMake package configs (e.g. Homebrew `llvm`):
-  - `MLIR_DIR` must point to the MLIR CMake config, typically:
-    - `/usr/local/opt/llvm/lib/cmake/mlir` (Homebrew)
-  - `FileCheck`, `llvm-lit`, and other LLVM tools on your `PATH` if you
-    want to run lit tests.
+- **LLVM + MLIR** with CMake package configs (e.g. Homebrew `llvm`):
+  - `MLIR_DIR` must point to the MLIR CMake config.
+  - `FileCheck` and `lit` on `PATH` (or set `LIT_FILECHECK` / `LLVM_EXTERNAL_LIT`) for lit tests.
+- **LLVM 19 + MLIR** – PTOAS expects **LLVM 19** (see PTOAS `CMakeLists.txt`). Use a build or install of LLVM 19 with MLIR enabled. From your `llvm-project` checkout you can build LLVM 19 + MLIR using the script under **Building LLVM 19** below.
+- **Triton** – the Triton MLIR dialects are built from a separate Triton source tree. Set `TRITON_SOURCE_DIR` (default: `../../triton` from `mlir_tool/`) to that checkout. **For LLVM 19**, use a Triton version that is compatible with LLVM 19 (e.g. a branch or tag that supports it); check Triton’s repo for the appropriate revision.
+- **PTOAS** – the PTO dialect and TableGen come from PTOAS. Either:
+  - **Option A (subproject):** set `PTOAS_SOURCE_DIR` to the PTOAS repo root. CMake will add PTOAS as a subproject and build `PTOIR`; you must point `LLVM_DIR` and `MLIR_DIR` at an LLVM 19 (+ MLIR) build or install.
+  - **Option B (installed):** install PTOAS, then set `PTOAS_DIR` to `lib/cmake/PTOAS` so `find_package(PTOAS)` succeeds.
+
+## Building LLVM 19
+
+PTOAS requires **LLVM 19**. With `llvm-project` at `LLVM_PROJECT_ROOT` (e.g. `../llvm-project` from `triton-to-pto`):
+
+1. **Optional:** use a clean LLVM 19 tree via worktree (avoids touching main):
+   ```bash
+   cd "${LLVM_PROJECT_ROOT}"
+   git fetch origin release/19.x
+   git worktree add llvm-19-worktree origin/release/19.x
+   ```
+2. **Build and install LLVM 19 + MLIR:**
+   ```bash
+   cd mlir_tool
+   LLVM_PROJECT_ROOT=/path/to/llvm-project ./scripts/build_llvm19.sh
+   ```
+   This configures and builds LLVM with `-DLLVM_ENABLE_PROJECTS=mlir`, then installs to `llvm-project/install-19` (or `LLVM_INSTALL_PREFIX`). Use that install for `MLIR_DIR` and `LLVM_DIR` below.
 
 ## Build
 
 From the `mlir_tool/` directory:
 
+**With PTOAS as subproject (Option A), using your LLVM 19 install:**
+
 ```bash
 cd mlir_tool
-cmake -S . -B build -DMLIR_DIR=/usr/local/opt/llvm/lib/cmake/mlir
+# For LLVM 19, use an LLVM-19-compatible Triton checkout (set TRITON_SOURCE_DIR if not ../../triton)
+cmake -S . -B build \
+  -DMLIR_DIR=/path/to/llvm-project/install-19/lib/cmake/mlir \
+  -DLLVM_DIR=/path/to/llvm-project/install-19/lib/cmake/llvm \
+  -DPTOAS_SOURCE_DIR=/path/to/PTOAS
+cmake --build build
+```
+
+**With installed PTOAS (Option B):**
+
+```bash
+cd mlir_tool
+cmake -S . -B build -DMLIR_DIR=/path/to/mlir -DPTOAS_DIR=/path/to/install/lib/cmake/PTOAS
 cmake --build build
 ```
 
 This builds:
 
-- `libPTOMLIRDialect.a` – the PTO dialect library.
-- `libTritonToPTOPass.a` – the Triton→PTO conversion pass.
-- `triton-to-pto-mlir` – the CLI tool:
-  - `build/tools/triton-to-pto-mlir/triton-to-pto-mlir`
+- `libTritonToPTOPass.a` – the Triton→PTO conversion pass (links to PTOAS’s PTOIR).
+- `triton-to-pto-mlir` – the CLI tool: `build/tools/triton-to-pto-mlir/triton-to-pto-mlir`
 
 ## Usage
 
@@ -100,16 +127,35 @@ This uses:
   and `CHECK` lines verifying that the output contains `pto.tload`,
   `pto.tadd`, and `pto.tstore` as expected.
 
-## Next steps / limitations
+## E2E testing with PTOAS simulator
 
-- The PTO dialect is currently **very minimal**:
-  - No custom types (`!pto.tile`, `!pto.memref`, `!pto.event`) wired yet.
-  - No custom assembly formats beyond the bare op names.
-- The Triton→PTO pass is **name-based only**:
-  - It does not yet use Triton’s real MLIR dialects or semantics.
-  - It does not yet map shapes/layouts or scalar control flow.
+You can run the full pipeline **Triton → triton-to-pto-mlir → PTOAS (.pto → ptoas → sim → compare)** using:
 
-The intent is for this prototype to serve as a starting point for a more
-complete MLIR-based Triton→PTO pipeline that can eventually target the
-PTO ISA / PTO-AS as specified in the upstream PTO Tile Lib.
+- **PTOAS repo** with `docker/run_sim_example.sh` and `test/npu_validation/scripts/generate_testcase.py`
+- **Docker image** `ptoas:py3.11` (build per PTOAS’s `docker/README.md`)
+- **Converter binary** on `PATH` or set `TRITON_TO_PTO_MLIR`
+
+From the repo root:
+
+```bash
+export PTOAS_ROOT=/path/to/PTOAS
+# Optional: export TRITON_TO_PTO_MLIR=/path/to/triton-to-pto-mlir
+mlir_tool/test/e2e_run_ptoas_sim.sh
+```
+
+Default input is `mlir_tool/test/vec_add_e2e_triton.mlir` (32×32 vec_add, 3 args, single block). The converter emits **native PTOAS** `.pto` (same dialect and assembly format as PTOAS; e.g. `!pto.tile_buf<loc=vec, dtype=..., rows=..., cols=...>`). The script writes it and runs `docker run ... ptoas:py3.11 bash docker/run_sim_example.sh <path>.pto`. Optionally set `USE_PTO_BRIDGE=1` to run the Python bridge on converter output (legacy). Success means the container exits 0 and the simulator compare passes.
+
+## Reproducible Docker build
+
+A Docker-based build in `docker/` fixes **LLVM** to the same version as PTOAS (`llvmorg-19.1.7`) and adds a **Triton** checkout at a configurable ref to form a reproducible environment. The image extends the PTOAS runtime (`ptoas:py3.11`) with `triton-to-pto-mlir` installed.
+
+- Build the PTOAS image first, then from the triton-to-pto repo root:  
+  `docker build -f docker/Dockerfile -t triton-to-pto:py3.11 .`
+- Build args: `LLVM_TAG` (default `llvmorg-19.1.7`), `TRITON_REF` (default `main`; use a known LLVM-19-compatible ref for reproducibility), optional `PTOAS_REF`.
+- See [docker/README.md](docker/README.md) for build order, build args, and how to run the converter and E2E inside the image.
+
+## Notes
+
+- **LLVM/MLIR version:** PTOAS and triton-to-pto must use the same LLVM/MLIR build or install to avoid ABI/header mismatches.
+- The Triton→PTO pass lowers Triton IR to PTOAS’s dialect ops and types; further ISA/layout mapping is out of scope of this repo.
 

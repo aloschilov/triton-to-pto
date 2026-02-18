@@ -1,0 +1,36 @@
+--- a/lib/Dialect/Triton/IR/Utility.cpp
++++ b/lib/Dialect/Triton/IR/Utility.cpp
+@@ -12,11 +12,11 @@ Value tt::getPredMask(RewriterBase &rewriter, Type typeLike, Value currentMask,
+   Value mask = pred;
+   if (isa<RankedTensorType>(maskType)) {
+-    mask = tt::SplatOp::create(rewriter, loc, maskType, pred);
++    mask = rewriter.create<tt::SplatOp>(loc, maskType, pred);
+   }
+   if (currentMask) {
+-    mask = arith::AndIOp::create(rewriter, loc, mask, currentMask);
++    mask = rewriter.create<arith::AndIOp>(loc, mask, currentMask);
+   }
+   return mask;
+ }
+@@ -95,13 +95,13 @@ Value tt::getLastInductionValue(OpBuilder &b, scf::ForOp loop) {
+   Location loc = loop.getLoc();
+   // (ub - lb -1) // step * step + lb
+   Value diff =
+-      arith::SubIOp::create(b, loc, loop.getUpperBound(), loop.getLowerBound());
++      b.create<arith::SubIOp>(loc, loop.getUpperBound(), loop.getLowerBound());
+   diff = arith::SubIOp::create(
+       b, loc, diff,
+-      arith::ConstantOp::create(b, loc, b.getIntegerAttr(diff.getType(), 1)));
+-  Value ceilStep = arith::MulIOp::create(
+-      b, loc, arith::DivSIOp::create(b, loc, diff, loop.getStep()),
++      b.create<arith::ConstantOp>(loc, b.getIntegerAttr(diff.getType(), 1)));
++  diff = b.create<arith::SubIOp>(loc, diff,
++      b.create<arith::ConstantOp>(loc, b.getIntegerAttr(diff.getType(), 1)));
++  Value ceilStep = b.create<arith::MulIOp>(loc,
++      b.create<arith::DivSIOp>(loc, diff, loop.getStep()),
+       loop.getStep());
+-  return arith::AddIOp::create(b, loc, ceilStep, loop.getLowerBound());
++  return b.create<arith::AddIOp>(loc, ceilStep, loop.getLowerBound());
+ }
+ 
+ bool tt::isKernel(FunctionOpInterface funcOp) {

@@ -1,0 +1,24 @@
+--- a/lib/Dialect/Triton/IR/Ops.cpp
++++ b/lib/Dialect/Triton/IR/Ops.cpp
+@@ -788,11 +788,9 @@ struct ExpandBroadcast final : public OpRewritePattern<ExpandDimsOp> {
+     auto newExpandTy = RankedTensorType::get(
+         newExpandShape, srcTy.getElementType(), newExpandEnc);
+-    auto newExpand = ExpandDimsOp::create(rewriter, op.getLoc(), newExpandTy,
+-                                          src, op.getAxis());
+-    auto newBroadcast = BroadcastOp::create(
+-        rewriter, broadcast.getLoc(), op.getType(), newExpand.getResult());
++    auto newExpand = rewriter.create<ExpandDimsOp>(op.getLoc(), newExpandTy, src, op.getAxis());
++    auto newBroadcast = rewriter.create<BroadcastOp>(broadcast.getLoc(), op.getType(), newExpand.getResult());
+     rewriter.replaceOp(op, {newBroadcast.getResult()});
+     return success();
+   }
+@@ -1103,7 +1101,7 @@ void FuncOp::build(OpBuilder &builder, OperationState &state,
+   if (argAttrs.empty())
+     return;
+   assert(type.getNumInputs() == argAttrs.size());
+-  call_interface_impl::addArgAndResultAttrs(
++  function_interface_impl::addArgAndResultAttrs(
+       builder, state, argAttrs, /*resultAttrs=*/{},
+       getArgAttrsAttrName(state.name), getResAttrsAttrName(state.name));
+ }
+ 

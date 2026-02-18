@@ -1,0 +1,48 @@
+--- a/lib/PTO/IR/PTO.cpp
++++ b/lib/PTO/IR/PTO.cpp
+@@ -1685,7 +1685,7 @@
+ // PTO_TCvtOp_DPS verification
+ //===----------------------------------------------------------------------===//
+ 
+-llvm::LogicalResult mlir::pto::CvtOp_DPS::verify() {
++mlir::LogicalResult mlir::pto::CvtOp_DPS::verify() {
+   auto srcTy = llvm::dyn_cast<mlir::MemRefType>(getSrc().getType());
+   auto dstTy = llvm::dyn_cast<mlir::MemRefType>(getDst().getType());
+   if (!srcTy || !dstTy) return emitOpError("expects memref src/dst");
+@@ -1959,7 +1959,7 @@
+ // GatherOp_DPS verification
+ //===----------------------------------------------------------------------===//
+ 
+-llvm::LogicalResult mlir::pto::GatherOp_DPS::verify() {
++mlir::LogicalResult mlir::pto::GatherOp_DPS::verify() {
+   auto srcTy = getSrc().getType().dyn_cast<mlir::MemRefType>();
+   auto offTy = getOffsets().getType().dyn_cast<mlir::MemRefType>();
+   auto dstTy = getDst().getType().dyn_cast<mlir::MemRefType>();
+@@ -3977,7 +3977,7 @@
+ // TCvtOp verification
+ //===----------------------------------------------------------------------===//
+ 
+-llvm::LogicalResult mlir::pto::TCvtOp::verify() {
++mlir::LogicalResult mlir::pto::TCvtOp::verify() {
+   auto srcTy = getSrc().getType().dyn_cast<mlir::RankedTensorType>();
+   auto dstTy = getDst().getType().dyn_cast<mlir::RankedTensorType>();
+   if (!srcTy || !dstTy)
+@@ -4200,7 +4200,7 @@
+ // TGatherOp verification
+ //===----------------------------------------------------------------------===//
+ 
+-llvm::LogicalResult mlir::pto::TGatherOp::verify() {
++mlir::LogicalResult mlir::pto::TGatherOp::verify() {
+   auto srcTy = getSrc().getType().dyn_cast<mlir::RankedTensorType>();
+   auto offTy = getOffsets().getType().dyn_cast<mlir::RankedTensorType>();
+   auto dstTy = getDst().getType().dyn_cast<mlir::RankedTensorType>();
+@@ -7029,7 +7029,7 @@
+ static void addEffect(
+     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>> &effects,
+     OpOperand *operand, MemoryEffects::Effect *effect) {
+   if (operand)
+-    effects.emplace_back(effect, operand, SideEffects::DefaultResource::get());
++    effects.emplace_back(effect, SideEffects::DefaultResource::get());
+ }
+ 
+ // 针对结果 (Result) 的重载

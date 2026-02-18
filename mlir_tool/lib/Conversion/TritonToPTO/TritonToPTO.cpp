@@ -20,9 +20,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/OperationSupport.h"
-#include "pto-mlir/Dialect/PTO/PTODialect.h"
-#define GET_OP_CLASSES
-#include "PTOOps.h.inc"
+#include "PTO/IR/PTO.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/Support/Casting.h"
 
@@ -32,6 +30,11 @@ using namespace mlir;
 using namespace mlir::triton;
 
 namespace {
+
+// Default address space for tile buffers (PTOAS uses "vec" for UB-style tiles).
+static pto::AddressSpaceAttr getDefaultTileAddressSpace(MLIRContext *ctx) {
+  return pto::AddressSpaceAttr::get(ctx, pto::AddressSpace::VEC);
+}
 
 //--- Block size inference ----------------------------------------------------
 
@@ -61,6 +64,9 @@ static int64_t inferBlockSize(ModuleOp module) {
 
 static std::pair<int64_t, int64_t> computeTileShape(int64_t numElements,
                                                      Type elementType) {
+  // E2E: match PTOAS VectorAddition (32x32) for 1024 f32 elements.
+  if (numElements == 1024 && (elementType.isF32() || elementType.isInteger(32)))
+    return {32, 32};
   // PTO alignment: Cols * sizeof(element) % 32 == 0. For f32 (4 bytes), Cols % 8 == 0.
   int64_t elemSize = 4;
   if (elementType.isF32() || elementType.isInteger(32))
@@ -100,7 +106,9 @@ public:
           return std::nullopt;
         Type elem = tensorType.getElementType();
         auto [rows, cols] = computeTileShape(n, elem);
-        return pto::TileBufType::get(type.getContext(), {rows, cols}, elem);
+        auto memSpace = getDefaultTileAddressSpace(type.getContext());
+        return pto::TileBufType::get(type.getContext(), {rows, cols}, elem,
+                                     memSpace);
       }
       if (type.isIntOrIndex() || llvm::isa<FloatType>(type))
         return type;
@@ -118,7 +126,9 @@ public:
         return std::nullopt;
       Type elem = type.getElementType();
       auto [rows, cols] = computeTileShape(n, elem);
-      return pto::TileBufType::get(type.getContext(), {rows, cols}, elem);
+      auto memSpace = getDefaultTileAddressSpace(type.getContext());
+      return pto::TileBufType::get(type.getContext(), {rows, cols}, elem,
+                                   memSpace);
     });
 
     // Materializations: needed by convertRegionTypes (e.g. scf.for bodies)
@@ -327,7 +337,7 @@ struct ConvertTTFuncOp : public OpConversionPattern<triton::FuncOp> {
     TypeConverter::SignatureConversion signatureConversion(newArgTypes.size());
     for (size_t i = 0; i < newArgTypes.size(); ++i)
       signatureConversion.addInputs(i, {newArgTypes[i]});
-    rewriter.applySignatureConversion(&*newFunc.getBody().begin(),
+    rewriter.applySignatureConversion(&newFunc.getBody(),
                                       signatureConversion);
     rewriter.eraseOp(op);
     return success();
@@ -363,8 +373,9 @@ struct ConvertTTLoadOp : public OpConversionPattern<LoadOp> {
         conv->convertType(op.getType()));
     if (!tileBufType)
       return rewriter.notifyMatchFailure(op, "unsupported result type");
-    int64_t rows = tileBufType.getDimSize(0);
-    int64_t cols = tileBufType.getDimSize(1);
+    auto shapeArr = tileBufType.getShape();
+    int64_t rows = shapeArr[0];
+    int64_t cols = shapeArr[1];
     Location loc = op.getLoc();
     Type indexType = rewriter.getIndexType();
     Value c0 = rewriter.create<arith::ConstantOp>(
@@ -378,18 +389,18 @@ struct ConvertTTLoadOp : public OpConversionPattern<LoadOp> {
     // PTOAS-aligned: variadic shape/strides keyword syntax
     auto tensorViewType = pto::TensorViewType::get(
         rewriter.getContext(), {rows, cols}, tileBufType.getElementType());
-    SmallVector<Value> shape = {cRows, cCols};
+    SmallVector<Value> shapeVals = {cRows, cCols};
     SmallVector<Value> strides = {cCols, c1};
-    Value tv = rewriter.create<pto::PTOMakeTensorViewOp>(
-        loc, tensorViewType, ptr, shape, strides);
+    Value tv = rewriter.create<pto::MakeTensorViewOp>(
+        loc, tensorViewType, ptr, shapeVals, strides, pto::LayoutAttr());
     auto partType = pto::PartitionTensorViewType::get(
         rewriter.getContext(), {rows, cols}, tileBufType.getElementType());
     SmallVector<Value> offsets = {c0, c0};
     SmallVector<Value> sizes = {cRows, cCols};
-    Value pv = rewriter.create<pto::PTOPartitionViewOp>(
+    Value pv = rewriter.create<pto::PartitionViewOp>(
         loc, partType, tv, offsets, sizes);
-    Value tile = rewriter.create<pto::PTOAllocTileOp>(loc, tileBufType);
-    rewriter.create<pto::PTOTLoadOp>(loc, pv, tile);
+    Value tile = rewriter.create<pto::AllocTileOp>(loc, tileBufType, Value(), Value());
+    rewriter.create<pto::TLoadOp>(loc, TypeRange{}, pv, tile);
     rewriter.replaceOp(op, tile);
     return success();
   }
@@ -405,8 +416,8 @@ struct ConvertArithAddFOp : public OpConversionPattern<arith::AddFOp> {
     auto tileBufType = llvm::dyn_cast<pto::TileBufType>(resType);
     if (!tileBufType)
       return rewriter.notifyMatchFailure(op, "not a tile buffer type");
-    Value dst = rewriter.create<pto::PTOAllocTileOp>(op.getLoc(), tileBufType);
-    rewriter.create<pto::PTOTAddOp>(op.getLoc(), adaptor.getLhs(),
+    Value dst = rewriter.create<pto::AllocTileOp>(op.getLoc(), tileBufType, Value(), Value());
+    rewriter.create<pto::TAddOp>(op.getLoc(), adaptor.getLhs(),
                                     adaptor.getRhs(), dst);
     rewriter.replaceOp(op, dst);
     return success();
@@ -438,26 +449,30 @@ struct ConvertTTReduceOp : public ConversionPattern {
     MLIRContext *ctx = rewriter.getContext();
     Type indexType = rewriter.getIndexType();
     Type elemType = tileBufType.getElementType();
-    int64_t rows = tileBufType.getDimSize(0);
-    int64_t cols = tileBufType.getDimSize(1);
+    auto tileShape = tileBufType.getShape();
+    int64_t rows = tileShape[0];
+    int64_t cols = tileShape[1];
+    auto memSpace = getDefaultTileAddressSpace(ctx);
 
     // 1. trowsum: RxC -> Rx1 (sum across columns for each row)
-    auto rowResultType = pto::TileBufType::get(ctx, {rows, 1}, elemType);
-    Value rsTmp = rewriter.create<pto::PTOAllocTileOp>(loc, tileBufType);
-    Value rsDst = rewriter.create<pto::PTOAllocTileOp>(loc, rowResultType);
-    rewriter.create<pto::PTOTRowSumOp>(loc, tile, rsTmp, rsDst);
+    auto rowResultType =
+        pto::TileBufType::get(ctx, {rows, 1}, elemType, memSpace);
+    Value rsTmp = rewriter.create<pto::AllocTileOp>(loc, tileBufType, Value(), Value());
+    Value rsDst = rewriter.create<pto::AllocTileOp>(loc, rowResultType, Value(), Value());
+    rewriter.create<pto::TRowSumOp>(loc, tile, rsTmp, rsDst);
 
     // 2. tcolsum: Rx1 -> 1x1 (sum across rows)
-    auto scalarTileType = pto::TileBufType::get(ctx, {1, 1}, elemType);
-    Value csTmp = rewriter.create<pto::PTOAllocTileOp>(loc, rowResultType);
-    Value csDst = rewriter.create<pto::PTOAllocTileOp>(loc, scalarTileType);
-    rewriter.create<pto::PTOTColSumOp>(loc, rsDst, csTmp, csDst);
+    auto scalarTileType =
+        pto::TileBufType::get(ctx, {1, 1}, elemType, memSpace);
+    Value csTmp = rewriter.create<pto::AllocTileOp>(loc, rowResultType, Value(), Value());
+    Value csDst = rewriter.create<pto::AllocTileOp>(loc, scalarTileType, Value(), Value());
+    rewriter.create<pto::TColSumOp>(loc, rsDst, csTmp, csDst);
 
     // 3. tgetval: extract scalar from 1x1 tile at offset 0
     Value c0_idx = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getIntegerAttr(indexType, 0));
     Value scalar =
-        rewriter.create<pto::PTOTGetValOp>(loc, resultType, csDst, c0_idx);
+        rewriter.create<pto::TGetValOp>(loc, resultType, csDst, c0_idx);
     rewriter.replaceOp(op, scalar);
     return success();
   }
@@ -496,26 +511,26 @@ struct ConvertTTStoreOp : public ConversionPattern {
       auto tileBufType = llvm::dyn_cast<pto::TileBufType>(value.getType());
       if (!tileBufType)
         return rewriter.notifyMatchFailure(op, "expected tile buffer type");
-      int64_t rows = tileBufType.getDimSize(0);
-      int64_t cols = tileBufType.getDimSize(1);
+      auto shapeArr = tileBufType.getShape();
+      int64_t rows = shapeArr[0];
+      int64_t cols = shapeArr[1];
       Value cRows = rewriter.create<arith::ConstantOp>(
           loc, rewriter.getIntegerAttr(indexType, rows));
       Value cCols = rewriter.create<arith::ConstantOp>(
           loc, rewriter.getIntegerAttr(indexType, cols));
-      // PTOAS-aligned: variadic shape/strides keyword syntax
       auto tensorViewType = pto::TensorViewType::get(
           ctx, {rows, cols}, tileBufType.getElementType());
-      SmallVector<Value> shape = {cRows, cCols};
+      SmallVector<Value> shapeValsStore = {cRows, cCols};
       SmallVector<Value> strides = {cCols, c1};
-      Value tv = rewriter.create<pto::PTOMakeTensorViewOp>(
-          loc, tensorViewType, ptr, shape, strides);
+      Value tv = rewriter.create<pto::MakeTensorViewOp>(
+          loc, tensorViewType, ptr, shapeValsStore, strides, pto::LayoutAttr());
       auto partType = pto::PartitionTensorViewType::get(
           ctx, {rows, cols}, tileBufType.getElementType());
       SmallVector<Value> offsets = {c0, c0};
       SmallVector<Value> sizes = {cRows, cCols};
-      Value pv = rewriter.create<pto::PTOPartitionViewOp>(
+      Value pv = rewriter.create<pto::PartitionViewOp>(
           loc, partType, tv, offsets, sizes);
-      rewriter.create<pto::PTOTStoreOp>(loc, value, pv);
+      rewriter.create<pto::TStoreOp>(loc, TypeRange{}, value, pv);
     } else {
       // Scalar store: PTOAS-aligned make_tensor_view + partition_view +
       //               alloc_tile(1x1) + tsetval + tstore
@@ -525,30 +540,29 @@ struct ConvertTTStoreOp : public ConversionPattern {
         return rewriter.notifyMatchFailure(op,
                                            "could not get scalar store indices");
       Type elemType = value.getType();
-      auto scalarTileType = pto::TileBufType::get(ctx, {1, 1}, elemType);
+      auto memSpace = getDefaultTileAddressSpace(ctx);
+      auto scalarTileType =
+          pto::TileBufType::get(ctx, {1, 1}, elemType, memSpace);
       auto tvType = pto::TensorViewType::get(
           ctx, {ShapedType::kDynamic, ShapedType::kDynamic}, elemType);
       auto pvType =
           pto::PartitionTensorViewType::get(ctx, {1, 1}, elemType);
 
-      // tensor_view over base pointer; shape = [row+1, 1] to be large enough
       Value rowPlus1 =
           rewriter.create<arith::AddIOp>(loc, indices->row, c1);
       SmallVector<Value> tvShape = {rowPlus1, c1};
       SmallVector<Value> tvStrides = {c1, c1};
-      Value tv = rewriter.create<pto::PTOMakeTensorViewOp>(
-          loc, tvType, indices->basePtr, tvShape, tvStrides);
+      Value tv = rewriter.create<pto::MakeTensorViewOp>(
+          loc, tvType, indices->basePtr, tvShape, tvStrides, pto::LayoutAttr());
 
-      // partition_view at [row, 0] with size [1, 1]
       SmallVector<Value> pvOffsets = {indices->row, c0};
       SmallVector<Value> pvSizes = {c1, c1};
-      Value pv = rewriter.create<pto::PTOPartitionViewOp>(
+      Value pv = rewriter.create<pto::PartitionViewOp>(
           loc, pvType, tv, pvOffsets, pvSizes);
 
-      // alloc 1x1 tile, set scalar value at offset 0, then tstore
-      Value tile = rewriter.create<pto::PTOAllocTileOp>(loc, scalarTileType);
-      rewriter.create<pto::PTOTSetValOp>(loc, tile, c0, value);
-      rewriter.create<pto::PTOTStoreOp>(loc, tile, pv);
+      Value tile = rewriter.create<pto::AllocTileOp>(loc, scalarTileType, Value(), Value());
+      rewriter.create<pto::TSetValOp>(loc, tile, c0, value);
+      rewriter.create<pto::TStoreOp>(loc, TypeRange{}, tile, pv);
     }
     rewriter.eraseOp(op);
     return success();
@@ -581,9 +595,8 @@ struct ConvertArithConstantOp : public OpConversionPattern<arith::ConstantOp> {
     // Create scalar constant from the splat value
     auto splatAttr = llvm::cast<TypedAttr>(dense.getSplatValue<Attribute>());
     Value scalar = rewriter.create<arith::ConstantOp>(loc, splatAttr);
-    // Allocate destination tile and broadcast scalar into it
-    Value tile = rewriter.create<pto::PTOAllocTileOp>(loc, tileBufType);
-    rewriter.create<pto::PTOTExpandsOp>(loc, scalar, tile);
+    Value tile = rewriter.create<pto::AllocTileOp>(loc, tileBufType, Value(), Value());
+    rewriter.create<pto::TExpandsOp>(loc, scalar, tile);
     rewriter.replaceOp(op, tile);
     return success();
   }
@@ -598,9 +611,8 @@ struct ConvertTTGetProgramIdOp
   matchAndRewrite(GetProgramIdOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    // pto.get_block_idx returns i64
     Value pid64 =
-        rewriter.create<pto::PTOGetBlockIdxOp>(loc, rewriter.getI64Type());
+        rewriter.create<pto::GetBlockIdxOp>(loc, rewriter.getI64Type());
     // Triton get_program_id returns i32 -- truncate
     Value pid32 =
         rewriter.create<arith::TruncIOp>(loc, rewriter.getI32Type(), pid64);
@@ -682,8 +694,9 @@ struct TritonToPTO : public PassWrapper<TritonToPTO, OperationPass<ModuleOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TritonToPTO)
 
   void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<pto::PTODialect, triton::TritonDialect, func::FuncDialect,
-                    arith::ArithDialect, mlir::scf::SCFDialect>();
+    registry.insert<mlir::pto::PTODialect, triton::TritonDialect,
+                    func::FuncDialect, arith::ArithDialect,
+                    mlir::scf::SCFDialect>();
   }
 
   StringRef getArgument() const final { return "convert-triton-to-pto"; }
@@ -693,8 +706,7 @@ struct TritonToPTO : public PassWrapper<TritonToPTO, OperationPass<ModuleOp>> {
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
-    // Ensure PTO dialect is loaded so custom types are registered with the uniquer.
-    getContext().getOrLoadDialect<pto::PTODialect>();
+    getContext().getOrLoadDialect<mlir::pto::PTODialect>();
     int64_t blockSize = inferBlockSize(module);
     TritonToPTOTypeConverter typeConverter(&getContext(), blockSize);
 
@@ -713,8 +725,8 @@ struct TritonToPTO : public PassWrapper<TritonToPTO, OperationPass<ModuleOp>> {
         typeConverter, &getContext());
 
     ConversionTarget target(getContext());
-    target.addLegalDialect<pto::PTODialect, func::FuncDialect,
-                           arith::ArithDialect>();
+    target.addLegalDialect<mlir::pto::PTODialect, func::FuncDialect,
+                          arith::ArithDialect>();
     target.addIllegalDialect<triton::TritonDialect>();
     // arith.muli: legal for scalars (e.g. pid * block_size), illegal for tensors
     target.addDynamicallyLegalOp<arith::MulIOp>([](arith::MulIOp op) {
