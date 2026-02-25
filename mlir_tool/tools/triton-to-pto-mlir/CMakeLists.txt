@@ -21,6 +21,7 @@ target_link_libraries(triton-to-pto-mlir
   MLIRControlFlowDialect
   MLIRFuncDialect
   MLIRTensorDialect
+  MLIRTransforms
   ${PTOIR_TARGET}
   TritonToPTOPass
 )

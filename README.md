@@ -5,9 +5,6 @@ This repository contains an **MLIR-based prototype** for lowering
 representation, using a small custom MLIR dialect and a standalone
 command-line tool.
 
-> Note: an earlier Python-based translator existed in this repo but has
-> been removed; the current direction is **C++ + LLVM/MLIR only** under
-> `mlir_tool/`.
 
 ## Layout
 
@@ -129,30 +126,26 @@ This uses:
 
 ## E2E testing with PTOAS simulator
 
-You can run the full pipeline **Triton → triton-to-pto-mlir → PTOAS (.pto → ptoas → sim → compare)** using:
+Two flows:
 
-- **PTOAS repo** with `docker/run_sim_example.sh` and `test/npu_validation/scripts/generate_testcase.py`
-- **Docker image** `ptoas:py3.11` (build per PTOAS’s `docker/README.md`)
-- **Converter binary** on `PATH` or set `TRITON_TO_PTO_MLIR`
+1. **PTOAS-only** (no converter): from PTOAS repo root, run a sample → .pto → sim:  
+   `docker run --rm -v "$(pwd)":/workspace -w /workspace ptoas:py3.11 bash -c "cd test/samples/Abs && python3 abs.py > abs.pto && bash /workspace/docker/run_sim_example.sh /workspace/test/samples/Abs/abs.pto"`
 
-From the repo root:
+2. **Full Triton → execution**: Triton MLIR → triton-to-pto-mlir → .pto → PTOAS sim. From this repo root:
+   ```bash
+   export PTOAS_ROOT=/path/to/PTOAS
+   mlir_tool/test/e2e_run_ptoas_sim.sh [optional_triton.mlir]
+   ```
+   Requires: PTOAS repo at `PTOAS_ROOT`, image `ptoas:py3.11`, and `triton-to-pto-mlir` on PATH (e.g. from `triton-to-pto:py3.11` or local build). Default input: `mlir_tool/test/vec_add_e2e_triton.mlir`. Optionally set `USE_PTO_BRIDGE=1` for the legacy Python bridge.
 
-```bash
-export PTOAS_ROOT=/path/to/PTOAS
-# Optional: export TRITON_TO_PTO_MLIR=/path/to/triton-to-pto-mlir
-mlir_tool/test/e2e_run_ptoas_sim.sh
-```
-
-Default input is `mlir_tool/test/vec_add_e2e_triton.mlir` (32×32 vec_add, 3 args, single block). The converter emits **native PTOAS** `.pto` (same dialect and assembly format as PTOAS; e.g. `!pto.tile_buf<loc=vec, dtype=..., rows=..., cols=...>`). The script writes it and runs `docker run ... ptoas:py3.11 bash docker/run_sim_example.sh <path>.pto`. Optionally set `USE_PTO_BRIDGE=1` to run the Python bridge on converter output (legacy). Success means the container exits 0 and the simulator compare passes.
+See [mlir_tool/test/README.md](mlir_tool/test/README.md) for details and build order.
 
 ## Reproducible Docker build
 
-A Docker-based build in `docker/` fixes **LLVM** to the same version as PTOAS (`llvmorg-19.1.7`) and adds a **Triton** checkout at a configurable ref to form a reproducible environment. The image extends the PTOAS runtime (`ptoas:py3.11`) with `triton-to-pto-mlir` installed.
+A Docker-based build in `docker/` uses a **pre-built LLVM base image** (`ptoas-llvm:19`) so triton-to-pto rebuilds do not rebuild LLVM. The image extends the PTOAS runtime (`ptoas:py3.11`) with `triton-to-pto-mlir` installed.
 
-- Build the PTOAS image first, then from the triton-to-pto repo root:  
-  `docker build -f docker/Dockerfile -t triton-to-pto:py3.11 .`
-- Build args: `LLVM_TAG` (default `llvmorg-19.1.7`), `TRITON_REF` (default `main`; use a known LLVM-19-compatible ref for reproducibility), optional `PTOAS_REF`.
-- See [docker/README.md](docker/README.md) for build order, build args, and how to run the converter and E2E inside the image.
+**Build order:** (1) Build `ptoas-llvm:19` once (from PTOAS repo). (2) Build `ptoas:py3.11` (from PTOAS repo). (3) From this repo root: `docker build -f docker/Dockerfile -t triton-to-pto:py3.11 .`  
+Build args: `TRITON_REF` (default `v3.1.0`), optional `PTOAS_REF`. See [docker/README.md](docker/README.md) for full build order and E2E.
 
 ## Notes
 

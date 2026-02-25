@@ -15,6 +15,7 @@
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Transforms/Passes.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Support/LogicalResult.h"
@@ -36,6 +37,7 @@ using namespace mlir;
 
 // Forward-declared from TritonToPTO.cpp
 std::unique_ptr<Pass> createTritonToPTOPass();
+std::unique_ptr<Pass> createDropUnusedUnrealizedCastsPass();
 
 int main(int argc, char **argv) {
   DialectRegistry registry;
@@ -92,6 +94,9 @@ int main(int argc, char **argv) {
 
   PassManager pm(&context);
   pm.addPass(createTritonToPTOPass());
+  pm.addPass(createDropUnusedUnrealizedCastsPass());
+  pm.addPass(createCanonicalizerPass());
+  pm.addPass(createCSEPass());
 
   if (failed(pm.run(*module))) {
     llvm::errs() << "Triton->PTO pass pipeline failed.\n";

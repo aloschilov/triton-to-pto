@@ -5,6 +5,7 @@ build
 
 # Optional: shrink context and avoid unnecessary files
 .git
+.github
 .gitignore
 *.pyc
 __pycache__
@@ -12,3 +13,4 @@ __pycache__
 .pytest_cache
 *.egg-info
 .lit_test_times.txt
+README.md

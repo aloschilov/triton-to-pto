@@ -87,6 +87,17 @@ static std::pair<int64_t, int64_t> computeTileShape(int64_t numElements,
 
 //--- Type converter ----------------------------------------------------------
 
+// Convert tensor element type to PTO form (e.g. !tt.ptr<f32> -> !pto.ptr<f32>).
+static Type convertTensorElementType(Type elemType, MLIRContext *ctx) {
+  if (auto ptrType = dyn_cast<triton::PointerType>(elemType)) {
+    Type pointee = ptrType.getPointeeType();
+    if (!pointee.isIntOrFloat() && !isa<RankedTensorType>(pointee))
+      pointee = Float32Type::get(ctx);
+    return pto::PtrType::get(ctx, pointee);
+  }
+  return elemType;
+}
+
 class TritonToPTOTypeConverter : public TypeConverter {
 public:
   TritonToPTOTypeConverter(MLIRContext *ctx, int64_t blockSize)
@@ -105,9 +116,10 @@ public:
         if (ShapedType::isDynamic(n))
           return std::nullopt;
         Type elem = tensorType.getElementType();
+        Type ptoElem = convertTensorElementType(elem, type.getContext());
         auto [rows, cols] = computeTileShape(n, elem);
         auto memSpace = getDefaultTileAddressSpace(type.getContext());
-        return pto::TileBufType::get(type.getContext(), {rows, cols}, elem,
+        return pto::TileBufType::get(type.getContext(), {rows, cols}, ptoElem,
                                      memSpace);
       }
       if (type.isIntOrIndex() || llvm::isa<FloatType>(type))
@@ -125,9 +137,10 @@ public:
       if (ShapedType::isDynamic(n))
         return std::nullopt;
       Type elem = type.getElementType();
+      Type ptoElem = convertTensorElementType(elem, type.getContext());
       auto [rows, cols] = computeTileShape(n, elem);
       auto memSpace = getDefaultTileAddressSpace(type.getContext());
-      return pto::TileBufType::get(type.getContext(), {rows, cols}, elem,
+      return pto::TileBufType::get(type.getContext(), {rows, cols}, ptoElem,
                                    memSpace);
     });
 
@@ -629,7 +642,7 @@ struct EraseTritonOp : public OpConversionPattern<OpTy> {
   LogicalResult
   matchAndRewrite(OpTy op, typename OpTy::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // Replace each result with a legal value so remaining dead ops can be erased.
+    SmallVector<Value, 2> replacements;
     for (OpResult result : op->getResults()) {
       Type oldType = result.getType();
       Type newType = this->getTypeConverter()->convertType(oldType);
@@ -639,11 +652,16 @@ struct EraseTritonOp : public OpConversionPattern<OpTy> {
         Value c0 = rewriter.create<arith::ConstantOp>(
             op.getLoc(), newType,
             rewriter.getIntegerAttr(newType, 0));
-        rewriter.replaceAllUsesWith(result, c0);
+        replacements.push_back(c0);
+      } else if (auto tileBufType = llvm::dyn_cast<pto::TileBufType>(newType)) {
+        Value tile = rewriter.create<pto::AllocTileOp>(op.getLoc(), tileBufType,
+                                                       Value(), Value());
+        replacements.push_back(tile);
+      } else {
+        return rewriter.notifyMatchFailure(op, "unsupported result type for erase");
       }
-      // For tensor/pointer types, do not replace; only GetProgramIdOp has i32 result.
     }
-    rewriter.eraseOp(op);
+    rewriter.replaceOp(op, replacements);
     return success();
   }
 };
@@ -672,6 +690,20 @@ struct EraseArithAddIOp : public OpConversionPattern<arith::AddIOp> {
   LogicalResult
   matchAndRewrite(arith::AddIOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // Replace result so uses (addptr, cmpi, etc.) get a legal value before erase.
+    Type resultType = op.getResult().getType();
+    Type newType = getTypeConverter()->convertType(resultType);
+    if (!newType)
+      newType = resultType;
+    if (newType.isIntOrIndex()) {
+      Value c0 = rewriter.create<arith::ConstantOp>(
+          op.getLoc(), newType, rewriter.getIntegerAttr(newType, 0));
+      rewriter.replaceAllUsesWith(op.getResult(), c0);
+    } else if (auto tileBufType = llvm::dyn_cast<pto::TileBufType>(newType)) {
+      Value tile = rewriter.create<pto::AllocTileOp>(op.getLoc(), tileBufType,
+                                                     Value(), Value());
+      rewriter.replaceAllUsesWith(op.getResult(), tile);
+    }
     rewriter.eraseOp(op);
     return success();
   }
@@ -683,6 +715,19 @@ struct EraseArithCmpiOp : public OpConversionPattern<arith::CmpIOp> {
   LogicalResult
   matchAndRewrite(arith::CmpIOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    Type resultType = op.getResult().getType();
+    Type newType = getTypeConverter()->convertType(resultType);
+    if (!newType)
+      newType = resultType;
+    if (newType.isIntOrIndex()) {
+      Value c0 = rewriter.create<arith::ConstantOp>(
+          op.getLoc(), newType, rewriter.getIntegerAttr(newType, 0));
+      rewriter.replaceAllUsesWith(op.getResult(), c0);
+    } else if (auto tileBufType = llvm::dyn_cast<pto::TileBufType>(newType)) {
+      Value tile = rewriter.create<pto::AllocTileOp>(op.getLoc(), tileBufType,
+                                                      Value(), Value());
+      rewriter.replaceAllUsesWith(op.getResult(), tile);
+    }
     rewriter.eraseOp(op);
     return success();
   }
@@ -758,8 +803,27 @@ struct TritonToPTO : public PassWrapper<TritonToPTO, OperationPass<ModuleOp>> {
   }
 };
 
+//--- Cleanup: remove unused unrealized_conversion_cast (they may reference tt) -
+struct DropUnusedUnrealizedCasts
+    : public PassWrapper<DropUnusedUnrealizedCasts, OperationPass<ModuleOp>> {
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+    SmallVector<UnrealizedConversionCastOp, 8> toErase;
+    module.walk([&](UnrealizedConversionCastOp op) {
+      if (op.getResult(0).use_empty())
+        toErase.push_back(op);
+    });
+    for (UnrealizedConversionCastOp op : toErase)
+      op.erase();
+  }
+};
+
 } // namespace
 
 std::unique_ptr<Pass> createTritonToPTOPass() {
   return std::make_unique<TritonToPTO>();
+}
+
+std::unique_ptr<Pass> createDropUnusedUnrealizedCastsPass() {
+  return std::make_unique<DropUnusedUnrealizedCasts>();
 }
