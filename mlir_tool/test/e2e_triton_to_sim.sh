@@ -15,6 +15,7 @@ TRITON_INPUT_ABS="$(cd "$(dirname "${TRITON_INPUT}")" && pwd)/$(basename "${TRIT
 INPUT_DIR="$(dirname "${TRITON_INPUT_ABS}")"
 INPUT_NAME="$(basename "${TRITON_INPUT_ABS}")"
 PTO_OUT="/workspace/test/samples/VectorAddition/e2e_triton_to_pto.pto"
+N_ELEMENTS="${N_ELEMENTS:-98432}"
 TRITON_IMAGE="${TRITON_TO_PTO_IMAGE:-triton-to-pto:py3.11}"
 PTOAS_IMAGE="${PTOAS_DOCKER_IMAGE:-ptoas:py3.11}"
 
@@ -47,7 +48,7 @@ if ! docker run --rm \
   -v "${PTOAS_ROOT}:/workspace" \
   -w /workspace \
   "${PTOAS_IMAGE}" \
-  bash docker/run_sim_example.sh "${PTO_OUT}"; then
+  bash docker/run_sim_example.sh "${PTO_OUT}" --n-elements "${N_ELEMENTS}"; then
   echo "[e2e_triton_to_sim] FAILED." >&2
   exit 1
 fi

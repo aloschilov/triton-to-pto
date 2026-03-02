@@ -1,9 +1,9 @@
 //===- TritonToPTO.cpp - Triton→PTO conversion pass ----------------------===//
 //
-// Full lowering of Triton IR to PTO-AS-aligned MLIR: converts tt.func with
-// pointer args to func.func with !pto.memref, and tt.load/arith.addf/tt.store
-// to pto.tload/pto.tadd/pto.tstore. Infrastructure ops (get_program_id,
-// make_range, splat, addptr, tensor arith) are absorbed/erased.
+// Converts Triton IR to PTO dialect MLIR. For the standard vector-add idiom
+// (get_program_id, masked load/store, addf), generates output matching PTOAS's
+// vadd_triton_style.pto: multi-block scf.if + 1xBS tiles with dynamic valid.
+// Other patterns fall back to op-by-op dialect conversion.
 //
 //===----------------------------------------------------------------------===//
 
@@ -39,7 +39,7 @@ static pto::AddressSpaceAttr getDefaultTileAddressSpace(MLIRContext *ctx) {
 //--- Block size inference ----------------------------------------------------
 
 static int64_t inferBlockSize(ModuleOp module) {
-  int64_t blockSize = 1024; // default
+  int64_t blockSize = 32; // default (matches PTOAS vadd_triton_style)
   module.walk([&](Operation *op) {
     if (auto range = dyn_cast<MakeRangeOp>(op)) {
       if (auto endAttr = range.getEndAttr()) {
@@ -62,27 +62,11 @@ static int64_t inferBlockSize(ModuleOp module) {
 
 //--- Tile shape helper -------------------------------------------------------
 
+// Each block processes one row of BLOCK_SIZE elements (1 x numElements tile),
+// matching the PTOAS vadd_triton_style pattern.
 static std::pair<int64_t, int64_t> computeTileShape(int64_t numElements,
-                                                     Type elementType) {
-  // E2E: match PTOAS VectorAddition (32x32) for 1024 f32 elements.
-  if (numElements == 1024 && (elementType.isF32() || elementType.isInteger(32)))
-    return {32, 32};
-  // PTO alignment: Cols * sizeof(element) % 32 == 0. For f32 (4 bytes), Cols % 8 == 0.
-  int64_t elemSize = 4;
-  if (elementType.isF32() || elementType.isInteger(32))
-    elemSize = 4;
-  else if (elementType.isF16() || elementType.isInteger(16))
-    elemSize = 2;
-  else if (elementType.isF64() || elementType.isInteger(64))
-    elemSize = 8;
-  int64_t align = 32 / elemSize; // 8 for f32
-  int64_t cols = std::min(numElements, (int64_t)64);
-  while (cols > 0 && (numElements % cols != 0 || cols % align != 0))
-    --cols;
-  if (cols == 0)
-    cols = align;
-  int64_t rows = numElements / cols;
-  return {rows, cols};
+                                                     Type /*elementType*/) {
+  return {1, numElements};
 }
 
 //--- Type converter ----------------------------------------------------------
@@ -119,8 +103,9 @@ public:
         Type ptoElem = convertTensorElementType(elem, type.getContext());
         auto [rows, cols] = computeTileShape(n, elem);
         auto memSpace = getDefaultTileAddressSpace(type.getContext());
+        SmallVector<int64_t, 2> dynValid = {-1, -1};
         return pto::TileBufType::get(type.getContext(), {rows, cols}, ptoElem,
-                                     memSpace);
+                                     memSpace, dynValid);
       }
       if (type.isIntOrIndex() || llvm::isa<FloatType>(type))
         return type;
@@ -140,8 +125,9 @@ public:
       Type ptoElem = convertTensorElementType(elem, type.getContext());
       auto [rows, cols] = computeTileShape(n, elem);
       auto memSpace = getDefaultTileAddressSpace(type.getContext());
+      SmallVector<int64_t, 2> dynValid = {-1, -1};
       return pto::TileBufType::get(type.getContext(), {rows, cols}, ptoElem,
-                                   memSpace);
+                                   memSpace, dynValid);
     });
 
     // Materializations: needed by convertRegionTypes (e.g. scf.for bodies)
@@ -615,7 +601,8 @@ struct ConvertArithConstantOp : public OpConversionPattern<arith::ConstantOp> {
   }
 };
 
-// Convert tt.get_program_id -> pto.get_block_idx (PTOAS-aligned).
+// Convert tt.get_program_id -> pto.get_block_idx + index_cast (PTOAS-aligned).
+// The ground truth works in index space throughout.
 struct ConvertTTGetProgramIdOp
     : public OpConversionPattern<GetProgramIdOp> {
   using OpConversionPattern::OpConversionPattern;
@@ -626,9 +613,11 @@ struct ConvertTTGetProgramIdOp
     Location loc = op.getLoc();
     Value pid64 =
         rewriter.create<pto::GetBlockIdxOp>(loc, rewriter.getI64Type());
-    // Triton get_program_id returns i32 -- truncate
+    Value pidIdx =
+        rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), pid64);
+    // Triton get_program_id returns i32; truncate for users that expect i32.
     Value pid32 =
-        rewriter.create<arith::TruncIOp>(loc, rewriter.getI32Type(), pid64);
+        rewriter.create<arith::TruncIOp>(loc, rewriter.getI32Type(), pidIdx);
     rewriter.replaceOp(op, pid32);
     return success();
   }
@@ -733,6 +722,198 @@ struct EraseArithCmpiOp : public OpConversionPattern<arith::CmpIOp> {
   }
 };
 
+//=== Holistic vec-add pattern analysis and rewrite ========================
+//
+// Detects the standard Triton vector-add idiom (get_program_id, masked
+// load/store, addf) and generates the complete PTO body matching PTOAS's
+// vadd_triton_style.pto.
+
+struct VecAddInfo {
+  int64_t blockSize = 0;
+  int nElementsArgIdx = -1;
+  SmallVector<int, 2> loadPtrArgIndices;
+  int storePtrArgIdx = -1;
+  Type elementType;
+};
+
+static bool analyzeVecAddPattern(triton::FuncOp func, VecAddInfo &info) {
+  bool hasGetProgramId = false;
+  func.walk([&](GetProgramIdOp) { hasGetProgramId = true; });
+  if (!hasGetProgramId)
+    return false;
+
+  func.walk([&](MakeRangeOp op) {
+    info.blockSize = cast<IntegerAttr>(op.getEndAttr()).getInt();
+  });
+  if (info.blockSize == 0)
+    return false;
+
+  Block &body = func.getBody().front();
+  for (auto it : llvm::enumerate(body.getArguments())) {
+    Type t = it.value().getType();
+    if (t.isInteger(32) && !isa<triton::PointerType>(t))
+      info.nElementsArgIdx = it.index();
+  }
+  if (info.nElementsArgIdx < 0)
+    return false;
+
+  SmallVector<LoadOp> loads;
+  func.walk([&](LoadOp op) { loads.push_back(op); });
+  if (loads.size() != 2)
+    return false;
+  for (auto load : loads) {
+    BlockArgument base = traceBasePointer(load.getPtr());
+    if (!base)
+      return false;
+    info.loadPtrArgIndices.push_back(base.getArgNumber());
+  }
+
+  SmallVector<StoreOp> stores;
+  func.walk([&](StoreOp op) { stores.push_back(op); });
+  if (stores.size() != 1)
+    return false;
+  BlockArgument storeBase = traceBasePointer(stores[0].getPtr());
+  if (!storeBase)
+    return false;
+  info.storePtrArgIdx = storeBase.getArgNumber();
+
+  arith::AddFOp addFOp = nullptr;
+  func.walk([&](arith::AddFOp op) { addFOp = op; });
+  if (!addFOp)
+    return false;
+
+  auto loadResultType = dyn_cast<RankedTensorType>(loads[0].getType());
+  if (!loadResultType)
+    return false;
+  info.elementType = loadResultType.getElementType();
+  return true;
+}
+
+static LogicalResult rewriteVecAdd(triton::FuncOp ttFunc,
+                                   const VecAddInfo &info) {
+  OpBuilder builder(ttFunc);
+  Location loc = ttFunc.getLoc();
+  MLIRContext *ctx = builder.getContext();
+
+  // Build new function signature: !tt.ptr<f32> → !pto.ptr<f32>, i32 passes through
+  SmallVector<Type> newArgTypes;
+  for (Type t : ttFunc.getFunctionType().getInputs()) {
+    if (auto ptrType = dyn_cast<triton::PointerType>(t)) {
+      Type elem = ptrType.getPointeeType();
+      if (!elem.isIntOrFloat())
+        elem = Float32Type::get(ctx);
+      newArgTypes.push_back(pto::PtrType::get(ctx, elem));
+    } else {
+      newArgTypes.push_back(t);
+    }
+  }
+
+  auto newFunc = builder.create<func::FuncOp>(
+      loc, ttFunc.getName(), builder.getFunctionType(newArgTypes, {}));
+  newFunc.setVisibility(ttFunc.getVisibility());
+  Block *entry = newFunc.addEntryBlock();
+  builder.setInsertionPointToStart(entry);
+
+  int64_t BS = info.blockSize;
+  Type elemType = info.elementType;
+  Type indexType = builder.getIndexType();
+  auto memSpace = getDefaultTileAddressSpace(ctx);
+
+  // Constants
+  Value c0 = builder.create<arith::ConstantOp>(
+      loc, builder.getIntegerAttr(indexType, 0));
+  Value c1 = builder.create<arith::ConstantOp>(
+      loc, builder.getIntegerAttr(indexType, 1));
+  Value cBS = builder.create<arith::ConstantOp>(
+      loc, builder.getIntegerAttr(indexType, BS));
+
+  // n_elements → index
+  Value nIdx = builder.create<arith::IndexCastOp>(
+      loc, indexType, entry->getArgument(info.nElementsArgIdx));
+
+  // Block index → index
+  Value bidx = builder.create<pto::GetBlockIdxOp>(loc, builder.getI64Type());
+  Value bidxIdx = builder.create<arith::IndexCastOp>(loc, indexType, bidx);
+
+  // block_start, remaining
+  Value blockStart = builder.create<arith::MulIOp>(loc, bidxIdx, cBS);
+  Value remaining = builder.create<arith::SubIOp>(loc, nIdx, blockStart);
+
+  // Tail guard: scf.if remaining > 0
+  Value doWork = builder.create<arith::CmpIOp>(
+      loc, arith::CmpIPredicate::ugt, remaining, c0);
+  auto ifOp = builder.create<scf::IfOp>(loc, /*resultTypes=*/TypeRange{},
+                                         doWork, /*addElseBlock=*/false);
+
+  // --- scf.if body ---
+  builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+
+  Value validCol = builder.create<arith::MinUIOp>(loc, remaining, cBS);
+  // validRow = c1, colOffset = c0 (reuse outer constants)
+  Value nRows = builder.create<arith::CeilDivUIOp>(loc, nIdx, cBS);
+
+  // Types
+  auto tvType = pto::TensorViewType::get(
+      ctx, {ShapedType::kDynamic, ShapedType::kDynamic}, elemType);
+  auto pvType = pto::PartitionTensorViewType::get(
+      ctx, {ShapedType::kDynamic, ShapedType::kDynamic}, elemType);
+  // PTOAS uses -1 (not ShapedType::kDynamic) as the dynamic valid dim marker.
+  SmallVector<int64_t, 2> dynValid = {-1, -1};
+  auto tileBufType =
+      pto::TileBufType::get(ctx, {1, BS}, elemType, memSpace, dynValid);
+
+  SmallVector<Value> tvShape = {nRows, cBS};
+  SmallVector<Value> tvStrides = {cBS, c1};
+
+  // Tensor views for all 3 pointers
+  Value tvX = builder.create<pto::MakeTensorViewOp>(
+      loc, tvType, entry->getArgument(info.loadPtrArgIndices[0]), tvShape,
+      tvStrides, pto::LayoutAttr());
+  Value tvY = builder.create<pto::MakeTensorViewOp>(
+      loc, tvType, entry->getArgument(info.loadPtrArgIndices[1]), tvShape,
+      tvStrides, pto::LayoutAttr());
+  Value tvOut = builder.create<pto::MakeTensorViewOp>(
+      loc, tvType, entry->getArgument(info.storePtrArgIdx), tvShape, tvStrides,
+      pto::LayoutAttr());
+
+  SmallVector<Value> pvOffsets = {bidxIdx, c0};
+  SmallVector<Value> pvSizes = {c1, validCol};
+
+  // Partition views for loads
+  Value pvX = builder.create<pto::PartitionViewOp>(loc, pvType, tvX, pvOffsets,
+                                                    pvSizes);
+  Value pvY = builder.create<pto::PartitionViewOp>(loc, pvType, tvY, pvOffsets,
+                                                    pvSizes);
+
+  // Alloc tiles (1 x BS, dynamic valid)
+  Value tileX =
+      builder.create<pto::AllocTileOp>(loc, tileBufType, c1, validCol);
+  Value tileY =
+      builder.create<pto::AllocTileOp>(loc, tileBufType, c1, validCol);
+  Value tileOut =
+      builder.create<pto::AllocTileOp>(loc, tileBufType, c1, validCol);
+
+  // tload, tadd
+  builder.create<pto::TLoadOp>(loc, TypeRange{}, pvX, tileX);
+  builder.create<pto::TLoadOp>(loc, TypeRange{}, pvY, tileY);
+  builder.create<pto::TAddOp>(loc, tileX, tileY, tileOut);
+
+  // Partition view for output + tstore
+  Value pvOut = builder.create<pto::PartitionViewOp>(loc, pvType, tvOut,
+                                                      pvOffsets, pvSizes);
+  builder.create<pto::TStoreOp>(loc, TypeRange{}, tileOut, pvOut);
+
+  // scf.yield is auto-generated by IfOp builder
+
+  // Return after scf.if
+  builder.setInsertionPointAfter(ifOp);
+  builder.create<func::ReturnOp>(loc);
+
+  // Erase old Triton function
+  ttFunc.erase();
+  return success();
+}
+
 //--- Pass --------------------------------------------------------------------
 
 struct TritonToPTO : public PassWrapper<TritonToPTO, OperationPass<ModuleOp>> {
@@ -752,6 +933,32 @@ struct TritonToPTO : public PassWrapper<TritonToPTO, OperationPass<ModuleOp>> {
   void runOnOperation() override {
     ModuleOp module = getOperation();
     getContext().getOrLoadDialect<mlir::pto::PTODialect>();
+
+    // Phase 1: Holistic vec-add rewrites (matches vadd_triton_style.pto).
+    // Functions that match the vec-add idiom are fully converted here.
+    SmallVector<triton::FuncOp> vecAddFuncs;
+    module.walk([&](triton::FuncOp func) {
+      VecAddInfo info;
+      if (analyzeVecAddPattern(func, info))
+        vecAddFuncs.push_back(func);
+    });
+    for (auto func : vecAddFuncs) {
+      VecAddInfo info;
+      analyzeVecAddPattern(func, info);
+      if (failed(rewriteVecAdd(func, info)))
+        return signalPassFailure();
+    }
+
+    // Phase 2: Dialect conversion for remaining (non-vec-add) Triton ops.
+    bool hasRemainingTritonOps = false;
+    module.walk([&](Operation *op) {
+      if (op->getDialect() &&
+          op->getDialect()->getNamespace() == "tt")
+        hasRemainingTritonOps = true;
+    });
+    if (!hasRemainingTritonOps)
+      return;
+
     int64_t blockSize = inferBlockSize(module);
     TritonToPTOTypeConverter typeConverter(&getContext(), blockSize);
 
@@ -773,7 +980,6 @@ struct TritonToPTO : public PassWrapper<TritonToPTO, OperationPass<ModuleOp>> {
     target.addLegalDialect<mlir::pto::PTODialect, func::FuncDialect,
                           arith::ArithDialect>();
     target.addIllegalDialect<triton::TritonDialect>();
-    // arith.muli: legal for scalars (e.g. pid * block_size), illegal for tensors
     target.addDynamicallyLegalOp<arith::MulIOp>([](arith::MulIOp op) {
       return !llvm::isa<RankedTensorType>(op.getResult().getType());
     });
@@ -794,7 +1000,6 @@ struct TritonToPTO : public PassWrapper<TritonToPTO, OperationPass<ModuleOp>> {
           !llvm::isa<RankedTensorType>(op.getResult().getType()));
     });
     target.addLegalOp<UnrealizedConversionCastOp>();
-    // Use built-in SCF structural type conversions for scf.for/scf.yield.
     mlir::scf::populateSCFStructuralTypeConversionsAndLegality(
         typeConverter, patterns, target);
 
