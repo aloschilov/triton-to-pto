@@ -40,22 +40,12 @@ static pto::AddressSpaceAttr getDefaultTileAddressSpace(MLIRContext *ctx) {
 
 static int64_t inferBlockSize(ModuleOp module) {
   int64_t blockSize = 32; // default (matches PTOAS vadd_triton_style)
-  module.walk([&](Operation *op) {
-    if (auto range = dyn_cast<MakeRangeOp>(op)) {
-      if (auto endAttr = range.getEndAttr()) {
-        if (auto intAttr = dyn_cast<IntegerAttr>(endAttr))
-          blockSize = intAttr.getInt();
-      }
-      return WalkResult::interrupt();
+  module.walk([&](MakeRangeOp range) {
+    if (auto endAttr = range.getEndAttr()) {
+      if (auto intAttr = dyn_cast<IntegerAttr>(endAttr))
+        blockSize = intAttr.getInt();
     }
-    if (auto cst = dyn_cast<arith::ConstantOp>(op)) {
-      if (cst.getType().isInteger(32)) {
-        if (auto intAttr = dyn_cast<IntegerAttr>(cst.getValue()))
-          blockSize = intAttr.getInt();
-      }
-      return WalkResult::interrupt();
-    }
-    return WalkResult::advance();
+    return WalkResult::interrupt();
   });
   return blockSize;
 }
@@ -655,72 +645,11 @@ struct EraseTritonOp : public OpConversionPattern<OpTy> {
   }
 };
 
-struct EraseArithMuliOp : public OpConversionPattern<arith::MulIOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(arith::MulIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    // Result may be used by splat; replace with 0 so uses get a legal value.
-    Type resultType = op.getResult().getType();
-    if (resultType.isIntOrIndex()) {
-      Value c0 = rewriter.create<arith::ConstantOp>(
-          op.getLoc(), rewriter.getIntegerAttr(resultType, 0));
-      rewriter.replaceAllUsesWith(op.getResult(), c0);
-    }
-    rewriter.eraseOp(op);
-    return success();
-  }
-};
-
-struct EraseArithAddIOp : public OpConversionPattern<arith::AddIOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(arith::AddIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    // Replace result so uses (addptr, cmpi, etc.) get a legal value before erase.
-    Type resultType = op.getResult().getType();
-    Type newType = getTypeConverter()->convertType(resultType);
-    if (!newType)
-      newType = resultType;
-    if (newType.isIntOrIndex()) {
-      Value c0 = rewriter.create<arith::ConstantOp>(
-          op.getLoc(), newType, rewriter.getIntegerAttr(newType, 0));
-      rewriter.replaceAllUsesWith(op.getResult(), c0);
-    } else if (auto tileBufType = llvm::dyn_cast<pto::TileBufType>(newType)) {
-      Value tile = rewriter.create<pto::AllocTileOp>(op.getLoc(), tileBufType,
-                                                     Value(), Value());
-      rewriter.replaceAllUsesWith(op.getResult(), tile);
-    }
-    rewriter.eraseOp(op);
-    return success();
-  }
-};
-
-struct EraseArithCmpiOp : public OpConversionPattern<arith::CmpIOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(arith::CmpIOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    Type resultType = op.getResult().getType();
-    Type newType = getTypeConverter()->convertType(resultType);
-    if (!newType)
-      newType = resultType;
-    if (newType.isIntOrIndex()) {
-      Value c0 = rewriter.create<arith::ConstantOp>(
-          op.getLoc(), newType, rewriter.getIntegerAttr(newType, 0));
-      rewriter.replaceAllUsesWith(op.getResult(), c0);
-    } else if (auto tileBufType = llvm::dyn_cast<pto::TileBufType>(newType)) {
-      Value tile = rewriter.create<pto::AllocTileOp>(op.getLoc(), tileBufType,
-                                                      Value(), Value());
-      rewriter.replaceAllUsesWith(op.getResult(), tile);
-    }
-    rewriter.eraseOp(op);
-    return success();
-  }
-};
+// NOTE: EraseArith{Muli,AddI,Cmpi}Op patterns were removed. They replaced
+// live SSA values with constant 0 before erasing, silently producing
+// incorrect PTO MLIR for any non-vec-add kernel. The holistic vec-add
+// rewrite (Phase 1) handles these ops correctly; Phase 2 should fail
+// loudly on unsupported arith ops rather than produce wrong output.
 
 //=== Holistic vec-add pattern analysis and rewrite ========================
 //
@@ -973,29 +902,16 @@ struct TritonToPTO : public PassWrapper<TritonToPTO, OperationPass<ModuleOp>> {
     patterns.add<EraseTritonOp<MakeRangeOp>,
                  EraseTritonOp<SplatOp>, EraseTritonOp<AddPtrOp>>(
         typeConverter, &getContext());
-    patterns.add<EraseArithMuliOp, EraseArithAddIOp, EraseArithCmpiOp>(
-        typeConverter, &getContext());
 
     ConversionTarget target(getContext());
     target.addLegalDialect<mlir::pto::PTODialect, func::FuncDialect,
                           arith::ArithDialect>();
     target.addIllegalDialect<triton::TritonDialect>();
-    target.addDynamicallyLegalOp<arith::MulIOp>([](arith::MulIOp op) {
-      return !llvm::isa<RankedTensorType>(op.getResult().getType());
-    });
     target.addDynamicallyLegalOp<arith::ConstantOp>([](arith::ConstantOp op) {
       return std::optional<bool>(
           !llvm::isa<RankedTensorType>(op.getResult().getType()));
     });
     target.addDynamicallyLegalOp<arith::AddFOp>([](arith::AddFOp op) {
-      return std::optional<bool>(
-          !llvm::isa<RankedTensorType>(op.getResult().getType()));
-    });
-    target.addDynamicallyLegalOp<arith::AddIOp>([](arith::AddIOp op) {
-      return std::optional<bool>(
-          !llvm::isa<RankedTensorType>(op.getResult().getType()));
-    });
-    target.addDynamicallyLegalOp<arith::CmpIOp>([](arith::CmpIOp op) {
       return std::optional<bool>(
           !llvm::isa<RankedTensorType>(op.getResult().getType()));
     });
