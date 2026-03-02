@@ -22,7 +22,7 @@ command-line tool.
     - `triton-to-pto-mlir.cpp` – parses an MLIR module, runs the
       `convert-triton-to-pto` pass, and prints the result.
   - `test/` – lit/FileCheck tests and E2E script:
-    - `vec_add_triton.mlir`, `reduce_sum_triton.mlir`, etc. – lit tests.
+    - `vec_add_e2e_triton.mlir`, `reduce_sum_triton.mlir`, etc. – lit tests.
     - `e2e_run_ptoas_sim.sh` – Triton → converter → .pto → PTOAS docker/sim.
 
 ## Prerequisites
@@ -89,7 +89,7 @@ dialect ops are treated as **unregistered** but still parsed):
 
 ```bash
 cd mlir_tool
-build/tools/triton-to-pto-mlir/triton-to-pto-mlir test/vec_add_triton.mlir -o /tmp/vec_add_pto.mlir
+build/tools/triton-to-pto-mlir/triton-to-pto-mlir test/vec_add_e2e_triton.mlir -o /tmp/vec_add_pto.mlir
 cat /tmp/vec_add_pto.mlir
 ```
 
@@ -115,7 +115,7 @@ cmake --build build --target check-mlir-tool
 This uses:
 
 - `test/lit.cfg.py` – to configure lit for `.mlir` tests.
-- `test/vec_add_triton.mlir` – which contains:
+- `test/vec_add_e2e_triton.mlir` – which contains:
 
   ```mlir
   // RUN: triton-to-pto-mlir %s -o - | FileCheck %s
