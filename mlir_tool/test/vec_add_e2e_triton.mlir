@@ -1,6 +1,6 @@
 // E2E test asset: Triton vector-add (BLOCK_SIZE=32) with get_program_id and
-// n_elements for multi-block execution. Produces PTO matching PTOAS's
-// vadd_triton_style.pto (1x32 tiles, scf.if tail, dynamic valid dims).
+// n_elements for multi-block execution. Produces PTO with grid-stride scf.for
+// loop (1x32 tiles, dynamic valid dims).
 //
 // RUN: %triton_to_pto_mlir %s -o - | %filecheck %s
 //
@@ -39,13 +39,14 @@ module {
 // CHECK-SAME: %arg2: !pto.ptr<f32>
 // CHECK-SAME: %arg3: i32)
 // CHECK: pto.get_block_idx
+// CHECK: pto.get_block_num
 // CHECK: arith.index_cast
+// CHECK: arith.index_cast
+// CHECK: arith.ceildivui
+// CHECK: scf.for
 // CHECK: arith.muli {{.*}} : index
 // CHECK: arith.subi {{.*}} : index
-// CHECK: arith.cmpi ugt
-// CHECK: scf.if
 // CHECK: arith.minui
-// CHECK: arith.ceildivui
 // CHECK: pto.make_tensor_view %arg0
 // CHECK: pto.make_tensor_view %arg1
 // CHECK: pto.make_tensor_view %arg2
@@ -59,6 +60,6 @@ module {
 // CHECK: pto.tadd
 // CHECK: pto.partition_view
 // CHECK: pto.tstore
-// CHECK: scf.yield
+// CHECK: }
 // CHECK: return
 // CHECK-NOT: tt.

@@ -1,10 +1,10 @@
-// Test: Triton sum-reduction kernel → PTO holistic rewrite.
-// Structure: get_program_id, masked load, tt.reduce(addf), scalar store.
+// Test: Triton element-wise exp kernel → PTO holistic rewrite.
+// Structure: get_program_id, masked load, math.exp, masked store.
 //
 // RUN: %triton_to_pto_mlir %s -o - | %filecheck %s
 //
 module {
-  tt.func public @reduce_sum_kernel(
+  tt.func public @exp_kernel(
     %input_ptr: !tt.ptr<f32>,
     %output_ptr: !tt.ptr<f32>,
     %n_elements: i32
@@ -17,37 +17,38 @@ module {
     %1 = arith.addi %0, %offsets : tensor<32xi32>
     %2 = tt.splat %n_elements : i32 -> tensor<32xi32>
     %mask = arith.cmpi slt, %1, %2 : tensor<32xi32>
-    %cst = arith.constant dense<0.0> : tensor<32xf32>
     %3 = tt.splat %input_ptr : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>>
     %4 = tt.addptr %3, %1 : tensor<32x!tt.ptr<f32>>, tensor<32xi32>
-    %x = tt.load %4, %mask, %cst : tensor<32x!tt.ptr<f32>>
-    %sum = "tt.reduce"(%x) ({
-    ^bb0(%arg0: f32, %arg1: f32):
-      %add = arith.addf %arg0, %arg1 : f32
-      "tt.reduce.return"(%add) : (f32) -> ()
-    }) {axis = 0 : i32} : (tensor<32xf32>) -> f32
-    %5 = tt.splat %output_ptr : !tt.ptr<f32> -> tensor<1x!tt.ptr<f32>>
-    %pid_idx = arith.extsi %pid : i32 to i64
-    %6 = tt.splat %pid_idx : i64 -> tensor<1xi64>
-    %7 = tt.addptr %5, %6 : tensor<1x!tt.ptr<f32>>, tensor<1xi64>
-    %sum_tensor = tt.splat %sum : f32 -> tensor<1xf32>
-    tt.store %7, %sum_tensor : tensor<1x!tt.ptr<f32>>
+    %x = tt.load %4, %mask : tensor<32x!tt.ptr<f32>>
+    %y = math.exp %x : tensor<32xf32>
+    %5 = tt.splat %output_ptr : !tt.ptr<f32> -> tensor<32x!tt.ptr<f32>>
+    %6 = tt.addptr %5, %1 : tensor<32x!tt.ptr<f32>>, tensor<32xi32>
+    tt.store %6, %y, %mask : tensor<32x!tt.ptr<f32>>
     tt.return
   }
 }
 
-// CHECK-LABEL: func.func @reduce_sum_kernel
+// CHECK-LABEL: func.func @exp_kernel
 // CHECK-SAME: %arg0: !pto.ptr<f32>
 // CHECK-SAME: %arg1: !pto.ptr<f32>
 // CHECK-SAME: %arg2: i32)
 // CHECK: pto.get_block_idx
 // CHECK: pto.get_block_num
+// CHECK: arith.index_cast
+// CHECK: arith.index_cast
 // CHECK: arith.ceildivui
 // CHECK: scf.for
+// CHECK: arith.muli {{.*}} : index
+// CHECK: arith.subi {{.*}} : index
+// CHECK: arith.minui
+// CHECK: pto.make_tensor_view %arg0
+// CHECK: pto.make_tensor_view %arg1
+// CHECK: pto.partition_view
+// CHECK: pto.alloc_tile valid_row
+// CHECK: pto.alloc_tile valid_row
 // CHECK: pto.tload
-// CHECK: pto.trowsum
-// CHECK: pto.tgetval
-// CHECK: pto.tsetval
+// CHECK: pto.texp
+// CHECK: pto.partition_view
 // CHECK: pto.tstore
 // CHECK: }
 // CHECK: return
