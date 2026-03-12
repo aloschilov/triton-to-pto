@@ -1,9 +1,9 @@
 //===- TritonToPTO.cpp - Triton→PTO conversion pass ----------------------===//
 //
 // Converts Triton IR to PTO dialect MLIR. Recognized kernel idioms (vec-add,
-// element-wise unary, reduction) use a grid-stride scf.for loop with
-// pto.get_block_num as stride, so each core processes multiple blocks.
-// Other patterns fall back to op-by-op dialect conversion.
+// element-wise unary, reduction, fused softmax) use a grid-stride scf.for
+// loop with pto.get_block_num as stride, so each core processes multiple
+// blocks. Other patterns fall back to op-by-op dialect conversion.
 //
 //===----------------------------------------------------------------------===//
 
@@ -609,6 +609,26 @@ struct ConvertTTGetProgramIdOp
     Value pid32 =
         rewriter.create<arith::TruncIOp>(loc, rewriter.getI32Type(), pidIdx);
     rewriter.replaceOp(op, pid32);
+    return success();
+  }
+};
+
+// Convert tt.get_num_programs -> pto.get_block_num + index_cast (Phase 2 fallback).
+struct ConvertTTGetNumProgramsOp
+    : public OpConversionPattern<GetNumProgramsOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(GetNumProgramsOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value num64 =
+        rewriter.create<pto::GetBlockNumOp>(loc, rewriter.getI64Type());
+    Value numIdx =
+        rewriter.create<arith::IndexCastOp>(loc, rewriter.getIndexType(), num64);
+    Value num32 =
+        rewriter.create<arith::TruncIOp>(loc, rewriter.getI32Type(), numIdx);
+    rewriter.replaceOp(op, num32);
     return success();
   }
 };
@@ -1243,6 +1263,268 @@ static LogicalResult rewriteReduction(triton::FuncOp ttFunc,
   return success();
 }
 
+//=== Holistic softmax pattern =================================================
+//
+// Detects the fused softmax kernel from the Triton tutorial:
+// grid-stride row loop (get_program_id/get_num_programs), per-row:
+// load, reduce(maxf), subf, exp, reduce(addf), divf, store.
+// Generates PTO: tload, trowmax, tsubs, texp, trowsum, tdivs, tstore.
+
+struct SoftmaxInfo {
+  int64_t blockSize = 0;
+  int inputPtrArgIdx = -1;
+  int outputPtrArgIdx = -1;
+  int inputRowStrideArgIdx = -1;
+  int outputRowStrideArgIdx = -1;
+  int nRowsArgIdx = -1;
+  int nColsArgIdx = -1;
+  Type elementType;
+};
+
+static bool analyzeSoftmax(triton::FuncOp func, SoftmaxInfo &info) {
+  // Key differentiator: tt.get_num_programs is unique to the softmax pattern.
+  bool hasGetNumPrograms = false;
+  func.walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "tt.get_num_programs")
+      hasGetNumPrograms = true;
+  });
+  if (!hasGetNumPrograms)
+    return false;
+
+  // Exactly 2 tt.reduce ops (maxf for row-max, addf for row-sum).
+  SmallVector<Operation *> reduces;
+  func.walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "tt.reduce")
+      reduces.push_back(op);
+  });
+  if (reduces.size() != 2)
+    return false;
+
+  bool hasExp = false;
+  func.walk([&](Operation *op) {
+    if (op->getName().getStringRef() == "math.exp")
+      hasExp = true;
+  });
+  if (!hasExp)
+    return false;
+
+  func.walk([&](MakeRangeOp op) {
+    info.blockSize = cast<IntegerAttr>(op.getEndAttr()).getInt();
+  });
+  if (info.blockSize == 0)
+    return false;
+
+  SmallVector<LoadOp> loads;
+  func.walk([&](LoadOp op) { loads.push_back(op); });
+  if (loads.size() != 1)
+    return false;
+
+  SmallVector<StoreOp> stores;
+  func.walk([&](StoreOp op) { stores.push_back(op); });
+  if (stores.size() != 1)
+    return false;
+
+  auto loadType = dyn_cast<RankedTensorType>(loads[0].getType());
+  if (!loadType)
+    return false;
+  info.elementType = loadType.getElementType();
+
+  BlockArgument loadBase = traceBasePointer(loads[0].getPtr());
+  BlockArgument storeBase = traceBasePointer(stores[0].getPtr());
+  if (!loadBase || !storeBase)
+    return false;
+  info.inputPtrArgIdx = loadBase.getArgNumber();
+  info.outputPtrArgIdx = storeBase.getArgNumber();
+
+  Block &entryBlock = func.getBody().front();
+
+  // n_rows: trace the scf.for upper bound through index_cast to a func arg.
+  scf::ForOp forOp = nullptr;
+  func.walk([&](scf::ForOp op) { forOp = op; });
+  if (!forOp)
+    return false;
+
+  if (auto ic = forOp.getUpperBound().getDefiningOp<arith::IndexCastOp>()) {
+    if (auto arg = dyn_cast<BlockArgument>(ic.getIn()))
+      if (arg.getOwner() == &entryBlock)
+        info.nRowsArgIdx = arg.getArgNumber();
+  }
+  if (info.nRowsArgIdx < 0)
+    return false;
+
+  // n_cols: the operand of tt.splat that feeds the arith.cmpi slt mask.
+  func.walk([&](arith::CmpIOp cmpOp) {
+    if (cmpOp.getPredicate() != arith::CmpIPredicate::slt)
+      return;
+    if (auto splat = cmpOp.getRhs().getDefiningOp<SplatOp>()) {
+      if (auto arg = dyn_cast<BlockArgument>(splat.getSrc()))
+        if (arg.getOwner() == &entryBlock)
+          info.nColsArgIdx = arg.getArgNumber();
+    }
+  });
+  if (info.nColsArgIdx < 0)
+    return false;
+
+  // Strides: find scalar tt.addptr(func_arg_ptr, muli(..., stride_arg)).
+  func.walk([&](AddPtrOp addptr) {
+    if (isa<RankedTensorType>(addptr.getPtr().getType()))
+      return;
+    auto baseArg = dyn_cast<BlockArgument>(addptr.getPtr());
+    if (!baseArg || baseArg.getOwner() != &entryBlock)
+      return;
+    int basePtrIdx = baseArg.getArgNumber();
+    auto muli = addptr.getOffset().getDefiningOp<arith::MulIOp>();
+    if (!muli)
+      return;
+    for (Value operand : {muli.getLhs(), muli.getRhs()}) {
+      auto strideArg = dyn_cast<BlockArgument>(operand);
+      if (!strideArg || strideArg.getOwner() != &entryBlock)
+        continue;
+      if (basePtrIdx == info.inputPtrArgIdx)
+        info.inputRowStrideArgIdx = strideArg.getArgNumber();
+      else if (basePtrIdx == info.outputPtrArgIdx)
+        info.outputRowStrideArgIdx = strideArg.getArgNumber();
+    }
+  });
+
+  return info.inputRowStrideArgIdx >= 0 && info.outputRowStrideArgIdx >= 0;
+}
+
+static LogicalResult rewriteSoftmax(triton::FuncOp ttFunc,
+                                    const SoftmaxInfo &info) {
+  OpBuilder builder(ttFunc);
+  Location loc = ttFunc.getLoc();
+  MLIRContext *ctx = builder.getContext();
+
+  SmallVector<Type> newArgTypes;
+  for (Type t : ttFunc.getFunctionType().getInputs()) {
+    if (auto ptrType = dyn_cast<triton::PointerType>(t)) {
+      Type elem = ptrType.getPointeeType();
+      if (!elem.isIntOrFloat())
+        elem = Float32Type::get(ctx);
+      newArgTypes.push_back(pto::PtrType::get(ctx, elem));
+    } else {
+      newArgTypes.push_back(t);
+    }
+  }
+
+  auto newFunc = builder.create<func::FuncOp>(
+      loc, ttFunc.getName(), builder.getFunctionType(newArgTypes, {}));
+  newFunc.setVisibility(ttFunc.getVisibility());
+  Block *entry = newFunc.addEntryBlock();
+  builder.setInsertionPointToStart(entry);
+
+  int64_t BS = info.blockSize;
+  Type elemType = info.elementType;
+  Type indexType = builder.getIndexType();
+  auto memSpace = getDefaultTileAddressSpace(ctx);
+
+  Value c0 = builder.create<arith::ConstantOp>(
+      loc, builder.getIntegerAttr(indexType, 0));
+  Value c1 = builder.create<arith::ConstantOp>(
+      loc, builder.getIntegerAttr(indexType, 1));
+  Value cBS = builder.create<arith::ConstantOp>(
+      loc, builder.getIntegerAttr(indexType, BS));
+
+  Value nRowsIdx = builder.create<arith::IndexCastOp>(
+      loc, indexType, entry->getArgument(info.nRowsArgIdx));
+  Value nColsIdx = builder.create<arith::IndexCastOp>(
+      loc, indexType, entry->getArgument(info.nColsArgIdx));
+  Value inStrideIdx = builder.create<arith::IndexCastOp>(
+      loc, indexType, entry->getArgument(info.inputRowStrideArgIdx));
+  Value outStrideIdx = builder.create<arith::IndexCastOp>(
+      loc, indexType, entry->getArgument(info.outputRowStrideArgIdx));
+
+  // Grid-stride loop over rows
+  Value bidx = builder.create<pto::GetBlockIdxOp>(loc, builder.getI64Type());
+  Value nCores = builder.create<pto::GetBlockNumOp>(loc, builder.getI64Type());
+  Value bidxIdx = builder.create<arith::IndexCastOp>(loc, indexType, bidx);
+  Value strideIdx = builder.create<arith::IndexCastOp>(loc, indexType, nCores);
+
+  auto forOp = builder.create<scf::ForOp>(loc, bidxIdx, nRowsIdx, strideIdx);
+  builder.setInsertionPointToStart(forOp.getBody());
+  Value rowIdx = forOp.getInductionVar();
+
+  Value validCol = builder.create<arith::MinUIOp>(loc, nColsIdx, cBS);
+
+  // Tile types
+  auto tvType = pto::TensorViewType::get(
+      ctx, {ShapedType::kDynamic, ShapedType::kDynamic}, elemType);
+  auto pvType = pto::PartitionTensorViewType::get(
+      ctx, {ShapedType::kDynamic, ShapedType::kDynamic}, elemType);
+  SmallVector<int64_t, 2> dynValid = {-1, -1};
+  auto tileBufType =
+      pto::TileBufType::get(ctx, {1, BS}, elemType, memSpace, dynValid);
+  auto tmpTileBufType =
+      pto::TileBufType::get(ctx, {1, BS}, elemType, memSpace);
+  auto scalarTileBufType =
+      pto::TileBufType::get(ctx, {1, 1}, elemType, memSpace);
+
+  // Input tensor view: shape=[nRows, inStride], strides=[inStride, 1]
+  Value tvIn = builder.create<pto::MakeTensorViewOp>(
+      loc, tvType, entry->getArgument(info.inputPtrArgIdx),
+      SmallVector<Value>{nRowsIdx, inStrideIdx},
+      SmallVector<Value>{inStrideIdx, c1}, pto::LayoutAttr());
+
+  SmallVector<Value> pvOffsets = {rowIdx, c0};
+  SmallVector<Value> pvSizes = {c1, validCol};
+  Value pvIn = builder.create<pto::PartitionViewOp>(
+      loc, pvType, tvIn, pvOffsets, pvSizes);
+
+  // 1. Load row
+  Value src = builder.create<pto::AllocTileOp>(loc, tileBufType, c1, validCol);
+  builder.create<pto::TLoadOp>(loc, TypeRange{}, pvIn, src);
+
+  // 2. Row max
+  Value maxTmp =
+      builder.create<pto::AllocTileOp>(loc, tmpTileBufType, Value(), Value());
+  Value scalarMaxTile =
+      builder.create<pto::AllocTileOp>(loc, scalarTileBufType, Value(), Value());
+  builder.create<pto::TRowMaxOp>(loc, src, maxTmp, scalarMaxTile);
+  Value maxVal =
+      builder.create<pto::TGetValOp>(loc, elemType, scalarMaxTile, c0);
+
+  // 3. Subtract max: dst = src - maxVal
+  Value shifted =
+      builder.create<pto::AllocTileOp>(loc, tileBufType, c1, validCol);
+  builder.create<pto::TSubSOp>(loc, src, maxVal, shifted);
+
+  // 4. Exp
+  Value expTile =
+      builder.create<pto::AllocTileOp>(loc, tileBufType, c1, validCol);
+  builder.create<pto::TExpOp>(loc, shifted, expTile);
+
+  // 5. Row sum
+  Value sumTmp =
+      builder.create<pto::AllocTileOp>(loc, tmpTileBufType, Value(), Value());
+  Value scalarSumTile =
+      builder.create<pto::AllocTileOp>(loc, scalarTileBufType, Value(), Value());
+  builder.create<pto::TRowSumOp>(loc, expTile, sumTmp, scalarSumTile);
+  Value sumVal =
+      builder.create<pto::TGetValOp>(loc, elemType, scalarSumTile, c0);
+
+  // 6. Divide by sum: dst = expTile / sumVal
+  Value result =
+      builder.create<pto::AllocTileOp>(loc, tileBufType, c1, validCol);
+  builder.create<pto::TDivSOp>(loc, expTile, sumVal, result);
+
+  // 7. Store result
+  Value tvOut = builder.create<pto::MakeTensorViewOp>(
+      loc, tvType, entry->getArgument(info.outputPtrArgIdx),
+      SmallVector<Value>{nRowsIdx, outStrideIdx},
+      SmallVector<Value>{outStrideIdx, c1}, pto::LayoutAttr());
+  Value pvOut = builder.create<pto::PartitionViewOp>(
+      loc, pvType, tvOut, pvOffsets, pvSizes);
+  builder.create<pto::TStoreOp>(loc, TypeRange{}, result, pvOut);
+
+  // Return after scf.for
+  builder.setInsertionPointAfter(forOp);
+  builder.create<func::ReturnOp>(loc);
+
+  ttFunc.erase();
+  return success();
+}
+
 //=== Holistic matmul pattern (detection only) ================================
 //
 // Detects Triton matmul kernels: tt.dot in a scf.for accumulation loop with
@@ -1309,6 +1591,12 @@ struct TritonToPTO : public PassWrapper<TritonToPTO, OperationPass<ModuleOp>> {
           return signalPassFailure();
         continue;
       }
+      SoftmaxInfo smInfo;
+      if (analyzeSoftmax(func, smInfo)) {
+        if (failed(rewriteSoftmax(func, smInfo)))
+          return signalPassFailure();
+        continue;
+      }
       ReductionInfo redInfo;
       if (analyzeReduction(func, redInfo)) {
         if (failed(rewriteReduction(func, redInfo)))
@@ -1344,7 +1632,8 @@ struct TritonToPTO : public PassWrapper<TritonToPTO, OperationPass<ModuleOp>> {
     patterns.add<ConvertTTReduceOp>(typeConverter, &getContext());
     patterns.add<ConvertArithConstantOp>(typeConverter, /*benefit=*/2,
                                          &getContext());
-    patterns.add<ConvertTTGetProgramIdOp>(typeConverter, &getContext());
+    patterns.add<ConvertTTGetProgramIdOp, ConvertTTGetNumProgramsOp>(
+        typeConverter, &getContext());
     patterns.add<EraseTritonOp<MakeRangeOp>,
                  EraseTritonOp<SplatOp>, EraseTritonOp<AddPtrOp>>(
         typeConverter, &getContext());
