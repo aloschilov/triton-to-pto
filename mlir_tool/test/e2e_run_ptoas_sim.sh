@@ -59,6 +59,10 @@ fi
 INPUT_BASENAME="$(basename "${TRITON_INPUT}" .mlir)"
 if [[ "${INPUT_BASENAME}" == *softmax* ]]; then
   PTOAS_SUBDIR="Softmax"
+elif [[ "${INPUT_BASENAME}" == *reduce* ]]; then
+  PTOAS_SUBDIR="Reduction"
+elif [[ "${INPUT_BASENAME}" == *unary* ]] || [[ "${INPUT_BASENAME}" == *exp* ]]; then
+  PTOAS_SUBDIR="UnaryExp"
 else
   PTOAS_SUBDIR="VectorAddition"
 fi

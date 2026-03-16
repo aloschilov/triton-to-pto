@@ -17,6 +17,10 @@ INPUT_NAME="$(basename "${TRITON_INPUT_ABS}")"
 # Route to appropriate PTOAS sample subdirectory based on input kernel.
 if [[ "${INPUT_NAME}" == *softmax* ]]; then
   PTOAS_SUBDIR="Softmax"
+elif [[ "${INPUT_NAME}" == *reduce* ]]; then
+  PTOAS_SUBDIR="Reduction"
+elif [[ "${INPUT_NAME}" == *unary* ]] || [[ "${INPUT_NAME}" == *exp* ]]; then
+  PTOAS_SUBDIR="UnaryExp"
 else
   PTOAS_SUBDIR="VectorAddition"
 fi

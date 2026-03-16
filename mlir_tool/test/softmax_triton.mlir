@@ -87,12 +87,10 @@ module {
 // CHECK: pto.partition_view
 // CHECK: pto.tload
 // CHECK: pto.trowmax
-// CHECK: pto.tgetval
-// CHECK: pto.tsubs
+// CHECK: pto.trowexpandsub
 // CHECK: pto.texp
 // CHECK: pto.trowsum
-// CHECK: pto.tgetval
-// CHECK: pto.tdivs
+// CHECK: pto.trowexpanddiv
 // CHECK: pto.partition_view
 // CHECK: pto.tstore
 // CHECK: }

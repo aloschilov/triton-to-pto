@@ -1,11 +1,32 @@
 # TritonToPTO MLIR tests
 
 - **Lit tests**: `lit.cfg.py` configures lit for `.mlir` tests. Run via `cmake --build build --target check-mlir-tool`.
-- **E2E**: two flows below (PTOAS-only and full Triton → execution).
+- **E2E**: three flows below.
+
+## Supported kernels
+
+| Kernel | Test file | PTOAS subdirectory |
+|---|---|---|
+| Vector add | `vec_add_e2e_triton.mlir` | `VectorAddition` |
+| Reduction (sum) | `reduce_sum_triton.mlir` | `Reduction` |
+| Unary (exp) | `unary_exp_triton.mlir` | `UnaryExp` |
+| Softmax (fused) | `softmax_triton.mlir` | `Softmax` |
 
 ## E2E flows
 
-### Flow 1: PTOAS-only (no converter)
+### Flow 1: All kernels (recommended)
+
+Runs all 4 holistic-rewrite kernels through the full pipeline inside Docker:
+
+```bash
+PTOAS_ROOT=/path/to/PTOAS mlir_tool/test/e2e_all.sh
+```
+
+For each kernel the script converts Triton IR to `.pto`, then runs ptoas assembly, C++ compilation, and Ascend simulator execution. Reports per-kernel pass/fail and overall status.
+
+Requires images `triton-to-pto:py3.11` and `ptoas:py3.11`.
+
+### Flow 2: PTOAS-only (no converter)
 
 Runs entirely inside `ptoas:py3.11` with the PTOAS repo mounted. Generate a `.pto` from a PTOAS sample, then run the simulator via `run_sim_example.sh`.
 
@@ -17,9 +38,9 @@ docker run --rm -v "$(pwd)":/workspace -w /workspace ptoas:py3.11 bash -c "cd te
 
 Requires: Docker image `ptoas:py3.11` (build from PTOAS repo per its `docker/README.md`).
 
-### Flow 2: Full Triton → execution
+### Flow 3: Single kernel (full Triton → execution)
 
-[Triton MLIR] → triton-to-pto-mlir → `.pto` → PTOAS sim (same as Flow 1 inside Docker).
+[Triton MLIR] → triton-to-pto-mlir → `.pto` → PTOAS sim (same as Flow 2 inside Docker).
 
 From the **triton-to-pto** repo root:
 
@@ -33,7 +54,7 @@ mlir_tool/test/e2e_run_ptoas_sim.sh [optional_triton.mlir]
 - **Converter**: on `PATH` or set `TRITON_TO_PTO_MLIR` (e.g. from `triton-to-pto:py3.11` or local build).
 - **Image**: `ptoas:py3.11`.
 
-Default input: `mlir_tool/test/vec_add_e2e_triton.mlir`. The script writes the generated `.pto` and runs `docker run ... ptoas:py3.11 bash docker/run_sim_example.sh <path>.pto`. Optionally set `USE_PTO_BRIDGE=1` for the legacy Python bridge on converter output.
+Default input: `mlir_tool/test/vec_add_e2e_triton.mlir`. The script auto-routes the generated `.pto` to the correct PTOAS sample subdirectory based on the kernel name. Optionally set `USE_PTO_BRIDGE=1` for the legacy Python bridge on converter output.
 
 **All-in-Docker (no converter on host):** run converter and sim entirely in containers:
 

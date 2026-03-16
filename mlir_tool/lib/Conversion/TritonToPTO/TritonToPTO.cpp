@@ -36,6 +36,31 @@ static pto::AddressSpaceAttr getDefaultTileAddressSpace(MLIRContext *ctx) {
   return pto::AddressSpaceAttr::get(ctx, pto::AddressSpace::VEC);
 }
 
+// PTO ISA requires Cols * sizeof(dtype) % 32 == 0 for row-major tiles.
+// Returns the minimum column count satisfying this for the given element type.
+static int64_t getMinAlignedCols(Type elemType) {
+  constexpr int64_t kAlignBytes = 32;
+  unsigned bits = elemType.getIntOrFloatBitWidth();
+  int64_t elemBytes = std::max<int64_t>(1, bits / 8);
+  return std::max<int64_t>(1, kAlignBytes / elemBytes);
+}
+
+// Create a TileBufType whose physical cols are padded to the PTO ISA minimum
+// alignment.  Valid dims are set to the logical (rows, cols) so that only the
+// meaningful elements participate in load/store/reduce operations.
+static pto::TileBufType getAlignedTileBufType(MLIRContext *ctx,
+                                              int64_t rows, int64_t cols,
+                                              Type elemType,
+                                              pto::AddressSpaceAttr memSpace) {
+  int64_t minCols = getMinAlignedCols(elemType);
+  int64_t physCols = std::max(cols, minCols);
+  if (physCols == cols)
+    return pto::TileBufType::get(ctx, {rows, cols}, elemType, memSpace);
+  SmallVector<int64_t, 2> validDims = {rows, cols};
+  return pto::TileBufType::get(ctx, {rows, physCols}, elemType, memSpace,
+                               validDims);
+}
+
 //--- Block size inference ----------------------------------------------------
 
 static int64_t inferBlockSize(ModuleOp module) {
@@ -445,19 +470,19 @@ struct ConvertTTReduceOp : public ConversionPattern {
 
     // 1. trowsum: RxC -> Rx1 (sum across columns for each row)
     auto rowResultType =
-        pto::TileBufType::get(ctx, {rows, 1}, elemType, memSpace);
+        getAlignedTileBufType(ctx, rows, 1, elemType, memSpace);
     Value rsTmp = rewriter.create<pto::AllocTileOp>(loc, tileBufType, Value(), Value());
     Value rsDst = rewriter.create<pto::AllocTileOp>(loc, rowResultType, Value(), Value());
     rewriter.create<pto::TRowSumOp>(loc, tile, rsTmp, rsDst);
 
     // 2. tcolsum: Rx1 -> 1x1 (sum across rows)
     auto scalarTileType =
-        pto::TileBufType::get(ctx, {1, 1}, elemType, memSpace);
+        getAlignedTileBufType(ctx, 1, 1, elemType, memSpace);
     Value csTmp = rewriter.create<pto::AllocTileOp>(loc, rowResultType, Value(), Value());
     Value csDst = rewriter.create<pto::AllocTileOp>(loc, scalarTileType, Value(), Value());
     rewriter.create<pto::TColSumOp>(loc, rsDst, csTmp, csDst);
 
-    // 3. tgetval: extract scalar from 1x1 tile at offset 0
+    // 3. tgetval: extract scalar from padded tile at offset 0
     Value c0_idx = rewriter.create<arith::ConstantOp>(
         loc, rewriter.getIntegerAttr(indexType, 0));
     Value scalar =
@@ -522,7 +547,7 @@ struct ConvertTTStoreOp : public ConversionPattern {
       rewriter.create<pto::TStoreOp>(loc, TypeRange{}, value, pv);
     } else {
       // Scalar store: PTOAS-aligned make_tensor_view + partition_view +
-      //               alloc_tile(1x1) + tsetval + tstore
+      //               alloc_tile(1xN) + tsetval + tstore
       std::optional<ScalarStoreIndices> indices =
           getScalarStoreIndices(origPtr, op, rewriter);
       if (!indices)
@@ -531,7 +556,7 @@ struct ConvertTTStoreOp : public ConversionPattern {
       Type elemType = value.getType();
       auto memSpace = getDefaultTileAddressSpace(ctx);
       auto scalarTileType =
-          pto::TileBufType::get(ctx, {1, 1}, elemType, memSpace);
+          getAlignedTileBufType(ctx, 1, 1, elemType, memSpace);
       auto tvType = pto::TensorViewType::get(
           ctx, {ShapedType::kDynamic, ShapedType::kDynamic}, elemType);
       auto pvType =
@@ -1212,11 +1237,11 @@ static LogicalResult rewriteReduction(triton::FuncOp ttFunc,
       builder.create<pto::AllocTileOp>(loc, tileBufType, c1, validCol);
   builder.create<pto::TLoadOp>(loc, TypeRange{}, pvIn, tileSrc);
 
-  // Reduce: trowsum/trowmax/trowmin -> 1xBS -> 1x1
+  // Reduce: trowsum/trowmax/trowmin -> 1xBS -> 1x1 (scalar)
   auto tmpTileBufType =
       pto::TileBufType::get(ctx, {1, BS}, elemType, memSpace);
   auto scalarTileBufType =
-      pto::TileBufType::get(ctx, {1, 1}, elemType, memSpace);
+      getAlignedTileBufType(ctx, 1, 1, elemType, memSpace);
   Value rsTmp =
       builder.create<pto::AllocTileOp>(loc, tmpTileBufType, Value(), Value());
   Value rsDst =
@@ -1250,7 +1275,7 @@ static LogicalResult rewriteReduction(triton::FuncOp ttFunc,
       SmallVector<Value>{c1, c1});
 
   auto scalarTileType =
-      pto::TileBufType::get(ctx, {1, 1}, elemType, memSpace);
+      getAlignedTileBufType(ctx, 1, 1, elemType, memSpace);
   Value scalarTile =
       builder.create<pto::AllocTileOp>(loc, scalarTileType, Value(), Value());
   builder.create<pto::TSetValOp>(loc, scalarTile, c0, scalar);
@@ -1458,7 +1483,7 @@ static LogicalResult rewriteSoftmax(triton::FuncOp ttFunc,
   auto tmpTileBufType =
       pto::TileBufType::get(ctx, {1, BS}, elemType, memSpace);
   auto scalarTileBufType =
-      pto::TileBufType::get(ctx, {1, 1}, elemType, memSpace);
+      getAlignedTileBufType(ctx, 1, 1, elemType, memSpace);
 
   // Tensor views: hoisted before the loop (loop-invariant).
   // shape = [nRows, nCols] describes the logical matrix;
@@ -1509,22 +1534,18 @@ static LogicalResult rewriteSoftmax(triton::FuncOp ttFunc,
 
   // 2. Row max
   builder.create<pto::TRowMaxOp>(loc, src, maxTmp, scalarMaxTile);
-  Value maxVal =
-      builder.create<pto::TGetValOp>(loc, elemType, scalarMaxTile, c0);
 
-  // 3. Subtract max
-  builder.create<pto::TSubSOp>(loc, src, maxVal, shifted);
+  // 3. Subtract max (tile-level broadcast: avoids scalar extraction in AIV loop)
+  builder.create<pto::TRowExpandSubOp>(loc, src, scalarMaxTile, shifted);
 
   // 4. Exp
   builder.create<pto::TExpOp>(loc, shifted, expTile);
 
   // 5. Row sum
   builder.create<pto::TRowSumOp>(loc, expTile, sumTmp, scalarSumTile);
-  Value sumVal =
-      builder.create<pto::TGetValOp>(loc, elemType, scalarSumTile, c0);
 
-  // 6. Divide by sum
-  builder.create<pto::TDivSOp>(loc, expTile, sumVal, result);
+  // 6. Divide by sum (tile-level broadcast)
+  builder.create<pto::TRowExpandDivOp>(loc, expTile, scalarSumTile, result);
 
   // 7. Store result
   Value pvOut = builder.create<pto::PartitionViewOp>(
