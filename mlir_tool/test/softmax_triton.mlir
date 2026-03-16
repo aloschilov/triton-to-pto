@@ -3,6 +3,11 @@
 // load, reduce(maximumf), subf, exp, reduce(addf), divf, store.
 // Based on triton/python/tutorials/02-fused-softmax.py (BLOCK_SIZE=256).
 //
+// Performance estimate (A2/A3 core, 1x256 f32 row = 1024 bytes):
+//   tload 84c + trowmax 20c + tgetval 1c + tsubs 10c + texp 10c +
+//   trowsum 20c + tgetval 1c + tdivs 10c + tstore 84c + scalar ~5c = ~245 cycles/row
+//   Compute-bound on VEC pipe after MTE overlap.
+//
 // RUN: %triton_to_pto_mlir %s -o - | %filecheck %s
 //
 module {
@@ -28,7 +33,7 @@ module {
       %input_ptrs = tt.addptr %0, %col_offsets : tensor<256x!tt.ptr<f32>>, tensor<256xi32>
       %1 = tt.splat %n_cols : i32 -> tensor<256xi32>
       %mask = arith.cmpi slt, %col_offsets, %1 : tensor<256xi32>
-      %cst = arith.constant dense<0.000000e+00> : tensor<256xf32>
+      %cst = arith.constant dense<0xFF800000> : tensor<256xf32>
       %row = tt.load %input_ptrs, %mask, %cst : tensor<256x!tt.ptr<f32>>
       %row_max = "tt.reduce"(%row) ({
       ^bb0(%arg0: f32, %arg1: f32):
@@ -64,11 +69,22 @@ module {
 // CHECK-SAME: %arg5: i32
 // CHECK: pto.get_block_idx
 // CHECK: pto.get_block_num
-// CHECK: scf.for
-// CHECK: arith.minui
+//        Tensor views hoisted before the loop:
 // CHECK: pto.make_tensor_view %arg1
-// CHECK: pto.partition_view
+// CHECK: pto.make_tensor_view %arg0
+//        Tile allocations hoisted before the loop (reused via DPS):
 // CHECK: pto.alloc_tile
+// CHECK: pto.alloc_tile
+// CHECK: pto.alloc_tile
+// CHECK: pto.alloc_tile
+// CHECK: pto.alloc_tile
+// CHECK: pto.alloc_tile
+// CHECK: pto.alloc_tile
+// CHECK: pto.alloc_tile
+//        Loop body: only partition_view + tile ops
+// CHECK: scf.for
+// CHECK-NOT: arith.minui
+// CHECK: pto.partition_view
 // CHECK: pto.tload
 // CHECK: pto.trowmax
 // CHECK: pto.tgetval
@@ -77,7 +93,6 @@ module {
 // CHECK: pto.trowsum
 // CHECK: pto.tgetval
 // CHECK: pto.tdivs
-// CHECK: pto.make_tensor_view %arg0
 // CHECK: pto.partition_view
 // CHECK: pto.tstore
 // CHECK: }

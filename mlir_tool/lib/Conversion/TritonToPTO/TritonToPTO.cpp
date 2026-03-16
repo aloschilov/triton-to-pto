@@ -1392,6 +1392,10 @@ static bool analyzeSoftmax(triton::FuncOp func, SoftmaxInfo &info) {
 
 static LogicalResult rewriteSoftmax(triton::FuncOp ttFunc,
                                     const SoftmaxInfo &info) {
+  // Per-row cycle estimate: ~245 cycles for 1x256 f32 tile (compute-bound
+  // on VEC pipe after MTE overlap). See a2a3_core_model.h for latencies:
+  //   tload 84c, trowmax 20c, tgetval 1c, tsubs 10c, texp 10c,
+  //   trowsum 20c, tgetval 1c, tdivs 10c, tstore 84c, scalar ~5c.
   OpBuilder builder(ttFunc);
   Location loc = ttFunc.getLoc();
   MLIRContext *ctx = builder.getContext();
@@ -1423,8 +1427,6 @@ static LogicalResult rewriteSoftmax(triton::FuncOp ttFunc,
       loc, builder.getIntegerAttr(indexType, 0));
   Value c1 = builder.create<arith::ConstantOp>(
       loc, builder.getIntegerAttr(indexType, 1));
-  Value cBS = builder.create<arith::ConstantOp>(
-      loc, builder.getIntegerAttr(indexType, BS));
 
   Value nRowsIdx = builder.create<arith::IndexCastOp>(
       loc, indexType, entry->getArgument(info.nRowsArgIdx));
@@ -1435,17 +1437,15 @@ static LogicalResult rewriteSoftmax(triton::FuncOp ttFunc,
   Value outStrideIdx = builder.create<arith::IndexCastOp>(
       loc, indexType, entry->getArgument(info.outputRowStrideArgIdx));
 
-  // Grid-stride loop over rows
+  // Grid-stride loop setup
   Value bidx = builder.create<pto::GetBlockIdxOp>(loc, builder.getI64Type());
   Value nCores = builder.create<pto::GetBlockNumOp>(loc, builder.getI64Type());
   Value bidxIdx = builder.create<arith::IndexCastOp>(loc, indexType, bidx);
   Value strideIdx = builder.create<arith::IndexCastOp>(loc, indexType, nCores);
 
-  auto forOp = builder.create<scf::ForOp>(loc, bidxIdx, nRowsIdx, strideIdx);
-  builder.setInsertionPointToStart(forOp.getBody());
-  Value rowIdx = forOp.getInductionVar();
-
-  Value validCol = builder.create<arith::MinUIOp>(loc, nColsIdx, cBS);
+  // validCol = nCols directly (BLOCK_SIZE >= n_cols by Triton convention,
+  // so the arith.minui that was here is dead code and has been removed).
+  Value validCol = nColsIdx;
 
   // Tile types
   auto tvType = pto::TensorViewType::get(
@@ -1460,59 +1460,73 @@ static LogicalResult rewriteSoftmax(triton::FuncOp ttFunc,
   auto scalarTileBufType =
       pto::TileBufType::get(ctx, {1, 1}, elemType, memSpace);
 
-  // Input tensor view: shape=[nRows, inStride], strides=[inStride, 1]
+  // Tensor views: hoisted before the loop (loop-invariant).
+  // shape = [nRows, nCols] describes the logical matrix;
+  // strides = [rowStride, 1] encodes the physical layout.
+  // A true single-row [1, BS] view would require a PTO pointer-advance op
+  // that does not yet exist; this whole-matrix view with partition_view is
+  // the idiomatic PTO pattern for strided 2D access.
   Value tvIn = builder.create<pto::MakeTensorViewOp>(
       loc, tvType, entry->getArgument(info.inputPtrArgIdx),
-      SmallVector<Value>{nRowsIdx, inStrideIdx},
+      SmallVector<Value>{nRowsIdx, nColsIdx},
       SmallVector<Value>{inStrideIdx, c1}, pto::LayoutAttr());
+  Value tvOut = builder.create<pto::MakeTensorViewOp>(
+      loc, tvType, entry->getArgument(info.outputPtrArgIdx),
+      SmallVector<Value>{nRowsIdx, nColsIdx},
+      SmallVector<Value>{outStrideIdx, c1}, pto::LayoutAttr());
 
-  SmallVector<Value> pvOffsets = {rowIdx, c0};
-  SmallVector<Value> pvSizes = {c1, validCol};
-  Value pvIn = builder.create<pto::PartitionViewOp>(
-      loc, pvType, tvIn, pvOffsets, pvSizes);
-
-  // 1. Load row
+  // Tile allocations: hoisted before the loop, reused across iterations.
+  // DPS write semantics make this safe -- each tile is fully overwritten
+  // before its data is consumed in the same iteration.
   Value src = builder.create<pto::AllocTileOp>(loc, tileBufType, c1, validCol);
-  builder.create<pto::TLoadOp>(loc, TypeRange{}, pvIn, src);
-
-  // 2. Row max
   Value maxTmp =
       builder.create<pto::AllocTileOp>(loc, tmpTileBufType, Value(), Value());
   Value scalarMaxTile =
       builder.create<pto::AllocTileOp>(loc, scalarTileBufType, Value(), Value());
-  builder.create<pto::TRowMaxOp>(loc, src, maxTmp, scalarMaxTile);
-  Value maxVal =
-      builder.create<pto::TGetValOp>(loc, elemType, scalarMaxTile, c0);
-
-  // 3. Subtract max: dst = src - maxVal
   Value shifted =
       builder.create<pto::AllocTileOp>(loc, tileBufType, c1, validCol);
-  builder.create<pto::TSubSOp>(loc, src, maxVal, shifted);
-
-  // 4. Exp
   Value expTile =
       builder.create<pto::AllocTileOp>(loc, tileBufType, c1, validCol);
-  builder.create<pto::TExpOp>(loc, shifted, expTile);
-
-  // 5. Row sum
   Value sumTmp =
       builder.create<pto::AllocTileOp>(loc, tmpTileBufType, Value(), Value());
   Value scalarSumTile =
       builder.create<pto::AllocTileOp>(loc, scalarTileBufType, Value(), Value());
+  Value result =
+      builder.create<pto::AllocTileOp>(loc, tileBufType, c1, validCol);
+
+  // Grid-stride row loop
+  auto forOp = builder.create<scf::ForOp>(loc, bidxIdx, nRowsIdx, strideIdx);
+  builder.setInsertionPointToStart(forOp.getBody());
+  Value rowIdx = forOp.getInductionVar();
+
+  SmallVector<Value> pvOffsets = {rowIdx, c0};
+  SmallVector<Value> pvSizes = {c1, validCol};
+
+  // 1. Load row
+  Value pvIn = builder.create<pto::PartitionViewOp>(
+      loc, pvType, tvIn, pvOffsets, pvSizes);
+  builder.create<pto::TLoadOp>(loc, TypeRange{}, pvIn, src);
+
+  // 2. Row max
+  builder.create<pto::TRowMaxOp>(loc, src, maxTmp, scalarMaxTile);
+  Value maxVal =
+      builder.create<pto::TGetValOp>(loc, elemType, scalarMaxTile, c0);
+
+  // 3. Subtract max
+  builder.create<pto::TSubSOp>(loc, src, maxVal, shifted);
+
+  // 4. Exp
+  builder.create<pto::TExpOp>(loc, shifted, expTile);
+
+  // 5. Row sum
   builder.create<pto::TRowSumOp>(loc, expTile, sumTmp, scalarSumTile);
   Value sumVal =
       builder.create<pto::TGetValOp>(loc, elemType, scalarSumTile, c0);
 
-  // 6. Divide by sum: dst = expTile / sumVal
-  Value result =
-      builder.create<pto::AllocTileOp>(loc, tileBufType, c1, validCol);
+  // 6. Divide by sum
   builder.create<pto::TDivSOp>(loc, expTile, sumVal, result);
 
   // 7. Store result
-  Value tvOut = builder.create<pto::MakeTensorViewOp>(
-      loc, tvType, entry->getArgument(info.outputPtrArgIdx),
-      SmallVector<Value>{nRowsIdx, outStrideIdx},
-      SmallVector<Value>{outStrideIdx, c1}, pto::LayoutAttr());
   Value pvOut = builder.create<pto::PartitionViewOp>(
       loc, pvType, tvOut, pvOffsets, pvSizes);
   builder.create<pto::TStoreOp>(loc, TypeRange{}, result, pvOut);

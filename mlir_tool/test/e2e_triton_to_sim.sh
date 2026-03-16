@@ -14,7 +14,13 @@ TRITON_INPUT="${1:-${SCRIPT_DIR}/vec_add_e2e_triton.mlir}"
 TRITON_INPUT_ABS="$(cd "$(dirname "${TRITON_INPUT}")" && pwd)/$(basename "${TRITON_INPUT}")"
 INPUT_DIR="$(dirname "${TRITON_INPUT_ABS}")"
 INPUT_NAME="$(basename "${TRITON_INPUT_ABS}")"
-PTO_OUT="/workspace/test/samples/VectorAddition/e2e_triton_to_pto.pto"
+# Route to appropriate PTOAS sample subdirectory based on input kernel.
+if [[ "${INPUT_NAME}" == *softmax* ]]; then
+  PTOAS_SUBDIR="Softmax"
+else
+  PTOAS_SUBDIR="VectorAddition"
+fi
+PTO_OUT="/workspace/test/samples/${PTOAS_SUBDIR}/e2e_triton_to_pto.pto"
 N_ELEMENTS="${N_ELEMENTS:-98432}"
 TRITON_IMAGE="${TRITON_TO_PTO_IMAGE:-triton-to-pto:py3.11}"
 PTOAS_IMAGE="${PTOAS_DOCKER_IMAGE:-ptoas:py3.11}"
@@ -40,7 +46,7 @@ docker run --rm \
   -v "${INPUT_DIR}:/input:ro" \
   -w /workspace \
   "${TRITON_IMAGE}" \
-  bash -c "mkdir -p /workspace/test/samples/VectorAddition && triton-to-pto-mlir /input/${INPUT_NAME} -o ${PTO_OUT}"
+  bash -c "mkdir -p /workspace/test/samples/${PTOAS_SUBDIR} && triton-to-pto-mlir /input/${INPUT_NAME} -o ${PTO_OUT}"
 
 # Step 2: run PTOAS sim in ptoas image
 echo "[e2e_triton_to_sim] Running PTOAS sim (${PTOAS_IMAGE})..."

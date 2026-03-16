@@ -9,6 +9,7 @@
 #     mlir_tool/test/e2e_run_ptoas_sim.sh [triton_input.mlir]
 #
 # Default Triton input: mlir_tool/test/vec_add_e2e_triton.mlir (32x32 vec_add, 3 args).
+# For softmax: mlir_tool/test/softmax_triton.mlir (1x256 fused softmax, 6 args).
 # Requires: PTOAS repo at PTOAS_ROOT, docker image ptoas:py3.11, run_sim_example.sh in PTOAS.
 set -euo pipefail
 
@@ -54,11 +55,17 @@ else
   echo "[e2e] Generated: ${GENERATED_PTO}"
 fi
 
-# Copy into PTOAS tree so docker (mounting PTOAS at /workspace) can see it.
-PTO_IN_PTOAS="${PTOAS_ROOT}/test/samples/VectorAddition/e2e_triton_to_pto.pto"
+# Route to appropriate PTOAS sample subdirectory based on input kernel.
+INPUT_BASENAME="$(basename "${TRITON_INPUT}" .mlir)"
+if [[ "${INPUT_BASENAME}" == *softmax* ]]; then
+  PTOAS_SUBDIR="Softmax"
+else
+  PTOAS_SUBDIR="VectorAddition"
+fi
+PTO_IN_PTOAS="${PTOAS_ROOT}/test/samples/${PTOAS_SUBDIR}/e2e_triton_to_pto.pto"
 mkdir -p "$(dirname "${PTO_IN_PTOAS}")"
 cp "${GENERATED_PTO}" "${PTO_IN_PTOAS}"
-WORKSPACE_PATH="/workspace/test/samples/VectorAddition/e2e_triton_to_pto.pto"
+WORKSPACE_PATH="/workspace/test/samples/${PTOAS_SUBDIR}/e2e_triton_to_pto.pto"
 
 echo "[e2e] Running PTOAS sim (docker image: ${DOCKER_IMAGE})..."
 if ! docker run --rm \
