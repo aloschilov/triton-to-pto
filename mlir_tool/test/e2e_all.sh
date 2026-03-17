@@ -22,7 +22,7 @@ if [[ ! -f "${PTOAS_ROOT}/docker/run_sim_example.sh" ]]; then
   exit 1
 fi
 
-KERNELS="vec_add_e2e_triton.mlir:VectorAddition reduce_sum_triton.mlir:Reduction unary_exp_triton.mlir:UnaryExp softmax_triton.mlir:Softmax"
+KERNELS="vec_add_e2e_triton.mlir:VectorAddition:vec_add reduce_sum_triton.mlir:Reduction:reduce_sum unary_exp_triton.mlir:UnaryExp:unary_exp softmax_triton.mlir:Softmax:softmax"
 
 PASS=0
 FAIL=0
@@ -30,7 +30,9 @@ FAILED_KERNELS=""
 
 for ENTRY in ${KERNELS}; do
   INPUT_NAME="${ENTRY%%:*}"
-  PTOAS_SUBDIR="${ENTRY##*:}"
+  rest="${ENTRY#*:}"
+  PTOAS_SUBDIR="${rest%%:*}"
+  KERNEL_NAME="${rest##*:}"
   INPUT_FILE="${SCRIPT_DIR}/${INPUT_NAME}"
   PTO_OUT="/workspace/test/samples/${PTOAS_SUBDIR}/e2e_triton_to_pto.pto"
 
@@ -66,6 +68,34 @@ for ENTRY in ${KERNELS}; do
     "${PTOAS_IMAGE}" \
     bash docker/run_sim_example.sh "${PTO_OUT}"; then
     echo "[e2e_all] FAIL: ${INPUT_NAME} (ptoas/sim failed)"
+    FAIL=$((FAIL + 1))
+    FAILED_KERNELS="${FAILED_KERNELS} ${INPUT_NAME}"
+    continue
+  fi
+
+  # Step 2b: CPU-sim for numerical accuracy
+  NV_DIR="/workspace/test/samples/${PTOAS_SUBDIR}/npu_validation/e2e_triton_to/"
+  PTO_CPP="/workspace/test/samples/${PTOAS_SUBDIR}/e2e_triton_to_pto.cpp"
+  echo "[e2e_all] Running CPU sim..."
+  if ! docker run --rm \
+    -v "${PTOAS_ROOT}:/workspace" \
+    -v "${SCRIPT_DIR}/cpu_sim:/cpu_sim:ro" \
+    "${PTOAS_IMAGE}" \
+    python3 /cpu_sim/cpu_sim_run.py "${PTO_CPP}" "${NV_DIR}"; then
+    echo "[e2e_all] FAIL: ${INPUT_NAME} (cpu-sim failed)"
+    FAIL=$((FAIL + 1))
+    FAILED_KERNELS="${FAILED_KERNELS} ${INPUT_NAME}"
+    continue
+  fi
+
+  # Step 3: independent golden accuracy check
+  echo "[e2e_all] Running golden accuracy check..."
+  if ! docker run --rm \
+    -v "${PTOAS_ROOT}:/workspace" \
+    -v "${SCRIPT_DIR}/golden:/golden:ro" \
+    "${PTOAS_IMAGE}" \
+    python3 /golden/golden_check.py "${KERNEL_NAME}" "${NV_DIR}"; then
+    echo "[e2e_all] FAIL: ${INPUT_NAME} (golden check failed)"
     FAIL=$((FAIL + 1))
     FAILED_KERNELS="${FAILED_KERNELS} ${INPUT_NAME}"
     continue
