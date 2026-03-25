@@ -36,6 +36,10 @@ Thumbs.db
 .idea/
 .vscode/
 .cursor/
+!.cursor/
+.cursor/*
+!.cursor/rules/
+!.cursor/rules/*.md
 *~
 *.swp
 *.swo
