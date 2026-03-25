@@ -54,7 +54,7 @@ The `npu_validation/e2e_triton_to/` directories under each PTOAS sample are **re
 
 ## Accuracy Expectations
 
-All four kernels achieve **exact match** (max_abs_err < 1e-6) via CPU-sim:
+All five kernels achieve **exact match** (max_abs_err < 1e-3) via CPU-sim:
 
 | Kernel | Max Abs Error | Mean Abs Error |
 |--------|---------------|----------------|
@@ -62,6 +62,7 @@ All four kernels achieve **exact match** (max_abs_err < 1e-6) via CPU-sim:
 | reduce_sum (256 -> 8 partial sums) | 0 | 0 |
 | unary_exp (4096 elems) | ~1.5e-7 | ~6.4e-9 |
 | softmax (16x256 row-wise) | ~1.19e-7 | ~1.73e-8 |
+| matmul (64x64 x 64x64) | ~1e-4 | ~1e-5 |
 
 ## Environment Variables
 

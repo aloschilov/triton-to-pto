@@ -22,7 +22,7 @@ if [[ ! -f "${PTOAS_ROOT}/docker/run_sim_example.sh" ]]; then
   exit 1
 fi
 
-KERNELS="vec_add_e2e_triton.mlir:VectorAddition:vec_add reduce_sum_triton.mlir:Reduction:reduce_sum unary_exp_triton.mlir:UnaryExp:unary_exp softmax_triton.mlir:Softmax:softmax"
+KERNELS="vec_add_e2e_triton.mlir:VectorAddition:vec_add reduce_sum_triton.mlir:Reduction:reduce_sum unary_exp_triton.mlir:UnaryExp:unary_exp softmax_triton.mlir:Softmax:softmax matmul_triton.mlir:MatMulSimple:matmul"
 
 PASS=0
 FAIL=0

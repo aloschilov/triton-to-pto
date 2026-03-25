@@ -11,12 +11,13 @@
 | Reduction (sum) | `reduce_sum_triton.mlir` | `Reduction` |
 | Unary (exp) | `unary_exp_triton.mlir` | `UnaryExp` |
 | Softmax (fused) | `softmax_triton.mlir` | `Softmax` |
+| Matrix multiply | `matmul_triton.mlir` | `MatMulSimple` |
 
 ## E2E flows
 
 ### Flow 1: All kernels (recommended)
 
-Runs all 4 holistic-rewrite kernels through the full pipeline inside Docker:
+Runs all 5 holistic-rewrite kernels through the full pipeline inside Docker:
 
 ```bash
 PTOAS_ROOT=/path/to/PTOAS mlir_tool/test/e2e_all.sh
@@ -94,6 +95,7 @@ Requirements: `g++-14` (C++23), installed automatically from `ppa:ubuntu-toolcha
 | reduce_sum | (256,) | (8,) | `v2[k] = sum(v1[k*32:(k+1)*32])` | 8 |
 | unary_exp | (4096,) | (4096,) | `exp(v1)` | 4096 |
 | softmax | (16, 256) | (16, 256) | row-wise `exp(x-max)/sum(exp(x-max))` | 4096 |
+| matmul | (64, 64) x (64, 64) | (64, 64) | `A @ B` | 4096 |
 
 The CPU-sim regenerates `.bin` files with non-trivial shapes for reduce_sum and softmax (see `KERNEL_CONFIGS` in `cpu_sim/cpu_sim_run.py`). The golden check auto-detects the configuration from input file sizes.
 

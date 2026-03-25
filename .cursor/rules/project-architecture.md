@@ -74,6 +74,7 @@ triton-to-pto/
 | reduce_sum | `tt.load` + `tt.reduce(add)` + `tt.store` | `pto.tload` + `pto.treduce` + `pto.tstore` |
 | unary_exp | `tt.load` + `math.exp` + `tt.store` | `pto.tload` + `pto.texp` + `pto.tstore` |
 | softmax | `tt.load` + row-max + exp + sum + div + `tt.store` | `pto.tload` + `pto.trowmax` + `pto.texp` + ... |
+| matmul | `tt.load` 2D + `tt.dot` + `tt.store` 2D | `pto.tload` + `pto.tmov` + `pto.tmatmul` / `pto.tmatmul.acc` + `pto.tstore` |
 
 ## Dependencies
 

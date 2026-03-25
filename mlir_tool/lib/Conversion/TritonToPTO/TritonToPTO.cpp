@@ -109,15 +109,24 @@ public:
         return pto::PtrType::get(type.getContext(), elem);
       }
       if (auto tensorType = dyn_cast<RankedTensorType>(type)) {
-        if (tensorType.getRank() != 1)
-          return std::nullopt;
-        int64_t n = tensorType.getNumElements();
-        if (ShapedType::isDynamic(n))
+        int rank = tensorType.getRank();
+        if (rank != 1 && rank != 2)
           return std::nullopt;
         Type elem = tensorType.getElementType();
         Type ptoElem = convertTensorElementType(elem, type.getContext());
-        auto [rows, cols] = computeTileShape(n, elem);
         auto memSpace = getDefaultTileAddressSpace(type.getContext());
+        if (rank == 2) {
+          int64_t rows = tensorType.getDimSize(0);
+          int64_t cols = tensorType.getDimSize(1);
+          if (ShapedType::isDynamic(rows) || ShapedType::isDynamic(cols))
+            return std::nullopt;
+          return pto::TileBufType::get(type.getContext(), {rows, cols}, ptoElem,
+                                       memSpace);
+        }
+        int64_t n = tensorType.getNumElements();
+        if (ShapedType::isDynamic(n))
+          return std::nullopt;
+        auto [rows, cols] = computeTileShape(n, elem);
         SmallVector<int64_t, 2> dynValid = {-1, -1};
         return pto::TileBufType::get(type.getContext(), {rows, cols}, ptoElem,
                                      memSpace, dynValid);
@@ -131,15 +140,24 @@ public:
       return std::nullopt;
     });
     addConversion([this](RankedTensorType type) -> std::optional<Type> {
-      if (type.getRank() != 1)
-        return std::nullopt;
-      int64_t n = type.getNumElements();
-      if (ShapedType::isDynamic(n))
+      int rank = type.getRank();
+      if (rank != 1 && rank != 2)
         return std::nullopt;
       Type elem = type.getElementType();
       Type ptoElem = convertTensorElementType(elem, type.getContext());
-      auto [rows, cols] = computeTileShape(n, elem);
       auto memSpace = getDefaultTileAddressSpace(type.getContext());
+      if (rank == 2) {
+        int64_t rows = type.getDimSize(0);
+        int64_t cols = type.getDimSize(1);
+        if (ShapedType::isDynamic(rows) || ShapedType::isDynamic(cols))
+          return std::nullopt;
+        return pto::TileBufType::get(type.getContext(), {rows, cols}, ptoElem,
+                                     memSpace);
+      }
+      int64_t n = type.getNumElements();
+      if (ShapedType::isDynamic(n))
+        return std::nullopt;
+      auto [rows, cols] = computeTileShape(n, elem);
       SmallVector<int64_t, 2> dynValid = {-1, -1};
       return pto::TileBufType::get(type.getContext(), {rows, cols}, ptoElem,
                                    memSpace, dynValid);
@@ -1560,33 +1578,303 @@ static LogicalResult rewriteSoftmax(triton::FuncOp ttFunc,
   return success();
 }
 
-//=== Holistic matmul pattern (detection only) ================================
+//=== Holistic matmul pattern ==================================================
 //
-// Detects Triton matmul kernels: tt.dot in a scf.for accumulation loop with
-// two 2D tile loads and one tile store. Full rewrite requires PTOAS matmul
-// ground-truth for validation, so detection is provided for early rejection
-// with a clear diagnostic.
+// Detects Triton matmul kernels: tt.dot in a scf.for K-accumulation loop with
+// 2D tile loads and one tile store.  Emits PTO IR following the PTOAS
+// tmatmulk.pto split-K pattern: tload -> tmov -> tmatmul/tmatmul.acc with
+// set_flag/wait_flag barriers between pipes.
 
 struct MatmulInfo {
   int64_t blockM = 0;
   int64_t blockN = 0;
   int64_t blockK = 0;
   Type elementType;
+  // Indices into the tt.func argument list.
+  int aPtrArgIdx = -1;
+  int bPtrArgIdx = -1;
+  int cPtrArgIdx = -1;
+  int mArgIdx = -1;
+  int nArgIdx = -1;
+  int kArgIdx = -1;
+  int strideAmIdx = -1;
+  int strideAkIdx = -1;
+  int strideBkIdx = -1;
+  int strideBnIdx = -1;
+  int strideCmIdx = -1;
+  int strideCnIdx = -1;
 };
 
 static bool analyzeMatmul(triton::FuncOp func, MatmulInfo &info) {
-  bool hasDot = false;
+  // Find tt.dot and extract block dimensions from its operand types.
+  Operation *dotOp = nullptr;
   func.walk([&](Operation *op) {
     if (op->getName().getStringRef() == "tt.dot")
-      hasDot = true;
+      dotOp = op;
   });
-  return hasDot;
+  if (!dotOp)
+    return false;
+
+  // tt.dot has 3 operands: lhs, rhs, accumulator.
+  if (dotOp->getNumOperands() < 3)
+    return false;
+  auto lhsType = dyn_cast<RankedTensorType>(dotOp->getOperand(0).getType());
+  auto rhsType = dyn_cast<RankedTensorType>(dotOp->getOperand(1).getType());
+  auto accType = dyn_cast<RankedTensorType>(dotOp->getOperand(2).getType());
+  if (!lhsType || !rhsType || !accType)
+    return false;
+  if (lhsType.getRank() != 2 || rhsType.getRank() != 2)
+    return false;
+
+  info.blockM = lhsType.getDimSize(0);
+  info.blockK = lhsType.getDimSize(1);
+  info.blockN = rhsType.getDimSize(1);
+  info.elementType = accType.getElementType();
+
+  // Identify function arguments by position.  The expected signature is:
+  //   (a_ptr, b_ptr, c_ptr, M, N, K,
+  //    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn)
+  Block &body = func.getBody().front();
+  if (body.getNumArguments() < 12)
+    return false;
+
+  // First three args must be pointers.
+  for (int i = 0; i < 3; ++i)
+    if (!isa<triton::PointerType>(body.getArgument(i).getType()))
+      return false;
+
+  info.aPtrArgIdx = 0;
+  info.bPtrArgIdx = 1;
+  info.cPtrArgIdx = 2;
+  info.mArgIdx = 3;
+  info.nArgIdx = 4;
+  info.kArgIdx = 5;
+  info.strideAmIdx = 6;
+  info.strideAkIdx = 7;
+  info.strideBkIdx = 8;
+  info.strideBnIdx = 9;
+  info.strideCmIdx = 10;
+  info.strideCnIdx = 11;
+
+  return true;
 }
 
 static LogicalResult rewriteMatmul(triton::FuncOp ttFunc,
-                                   const MatmulInfo & /*info*/) {
-  return ttFunc.emitError("matmul pattern detected but holistic rewrite not "
-                          "yet implemented; awaiting PTOAS ground-truth");
+                                   const MatmulInfo &info) {
+  OpBuilder builder(ttFunc);
+  Location loc = ttFunc.getLoc();
+  MLIRContext *ctx = builder.getContext();
+
+  // --- New function signature: convert !tt.ptr<f32> → !pto.ptr<f32> ---------
+  SmallVector<Type> newArgTypes;
+  for (Type t : ttFunc.getFunctionType().getInputs()) {
+    if (auto ptrType = dyn_cast<triton::PointerType>(t)) {
+      Type elem = ptrType.getPointeeType();
+      if (!elem.isIntOrFloat())
+        elem = Float32Type::get(ctx);
+      newArgTypes.push_back(pto::PtrType::get(ctx, elem));
+    } else {
+      newArgTypes.push_back(t);
+    }
+  }
+
+  auto newFunc = builder.create<func::FuncOp>(
+      loc, ttFunc.getName(), builder.getFunctionType(newArgTypes, {}));
+  newFunc.setVisibility(ttFunc.getVisibility());
+  Block *entry = newFunc.addEntryBlock();
+  builder.setInsertionPointToStart(entry);
+
+  int64_t BM = info.blockM;
+  int64_t BN = info.blockN;
+  int64_t BK = info.blockK;
+  Type elemType = info.elementType;
+  Type indexType = builder.getIndexType();
+
+  // --- Constants -------------------------------------------------------------
+  Value c0 = builder.create<arith::ConstantOp>(
+      loc, builder.getIntegerAttr(indexType, 0));
+  Value c1 = builder.create<arith::ConstantOp>(
+      loc, builder.getIntegerAttr(indexType, 1));
+  Value cBM = builder.create<arith::ConstantOp>(
+      loc, builder.getIntegerAttr(indexType, BM));
+  Value cBN = builder.create<arith::ConstantOp>(
+      loc, builder.getIntegerAttr(indexType, BN));
+  Value cBK = builder.create<arith::ConstantOp>(
+      loc, builder.getIntegerAttr(indexType, BK));
+
+  // --- Scalar args → index ---------------------------------------------------
+  auto toIndex = [&](int argIdx) -> Value {
+    Value v = entry->getArgument(argIdx);
+    return builder.create<arith::IndexCastOp>(loc, indexType, v);
+  };
+  Value mIdx = toIndex(info.mArgIdx);
+  Value nIdx = toIndex(info.nArgIdx);
+  Value kIdx = toIndex(info.kArgIdx);
+  Value strideAm = toIndex(info.strideAmIdx);
+  Value strideAk = toIndex(info.strideAkIdx);
+  Value strideBk = toIndex(info.strideBkIdx);
+  Value strideBn = toIndex(info.strideBnIdx);
+  Value strideCm = toIndex(info.strideCmIdx);
+  Value strideCn = toIndex(info.strideCnIdx);
+
+  // --- Compute pid_m, pid_n from block index ---------------------------------
+  Value bidx = builder.create<pto::GetBlockIdxOp>(loc, builder.getI64Type());
+  Value bidxIdx = builder.create<arith::IndexCastOp>(loc, indexType, bidx);
+  Value numPidN = builder.create<arith::CeilDivUIOp>(loc, nIdx, cBN);
+  Value pidM = builder.create<arith::DivUIOp>(loc, bidxIdx, numPidN);
+  Value pidN = builder.create<arith::RemUIOp>(loc, bidxIdx, numPidN);
+
+  // Row/col offsets for this block.
+  Value rowOff = builder.create<arith::MulIOp>(loc, pidM, cBM);
+  Value colOff = builder.create<arith::MulIOp>(loc, pidN, cBN);
+
+  // --- 2D Tensor Views for A, B, C ------------------------------------------
+  auto tv2Type = pto::TensorViewType::get(
+      ctx, {ShapedType::kDynamic, ShapedType::kDynamic}, elemType);
+
+  Value tvA = builder.create<pto::MakeTensorViewOp>(
+      loc, tv2Type, entry->getArgument(info.aPtrArgIdx),
+      SmallVector<Value>{mIdx, kIdx},
+      SmallVector<Value>{strideAm, strideAk}, pto::LayoutAttr());
+  Value tvB = builder.create<pto::MakeTensorViewOp>(
+      loc, tv2Type, entry->getArgument(info.bPtrArgIdx),
+      SmallVector<Value>{kIdx, nIdx},
+      SmallVector<Value>{strideBk, strideBn}, pto::LayoutAttr());
+  Value tvC = builder.create<pto::MakeTensorViewOp>(
+      loc, tv2Type, entry->getArgument(info.cPtrArgIdx),
+      SmallVector<Value>{mIdx, nIdx},
+      SmallVector<Value>{strideCm, strideCn}, pto::LayoutAttr());
+
+  // --- Tile allocations with correct address spaces --------------------------
+  auto matSpace = pto::AddressSpaceAttr::get(ctx, pto::AddressSpace::MAT);
+  auto leftSpace = pto::AddressSpaceAttr::get(ctx, pto::AddressSpace::LEFT);
+  auto rightSpace = pto::AddressSpaceAttr::get(ctx, pto::AddressSpace::RIGHT);
+  auto accSpace = pto::AddressSpaceAttr::get(ctx, pto::AddressSpace::ACC);
+
+  auto i32Ty = IntegerType::get(ctx, 32);
+  auto blRowMajor = IntegerAttr::get(i32Ty, 0);
+  auto blColMajor = IntegerAttr::get(i32Ty, 1);
+  auto slNoneBox = IntegerAttr::get(i32Ty, 0);
+  auto slRowMajor = IntegerAttr::get(i32Ty, 1);
+  auto slColMajor = IntegerAttr::get(i32Ty, 2);
+  auto padNull = IntegerAttr::get(i32Ty, 0);
+  auto fractal512 = IntegerAttr::get(i32Ty, 512);
+  auto fractal1024 = IntegerAttr::get(i32Ty, 1024);
+
+  auto matCfg = pto::TileBufConfigAttr::get(
+      ctx, blRowMajor, slNoneBox, fractal512, padNull);
+  auto leftCfg = pto::TileBufConfigAttr::get(
+      ctx, blColMajor, slRowMajor, fractal512, padNull);
+  auto rightCfg = pto::TileBufConfigAttr::get(
+      ctx, blRowMajor, slColMajor, fractal512, padNull);
+  auto accCfg = pto::TileBufConfigAttr::get(
+      ctx, blColMajor, slRowMajor, fractal1024, padNull);
+
+  auto matATileType =
+      pto::TileBufType::get(ctx, {BM, BK}, elemType, matSpace, matCfg);
+  auto matBTileType =
+      pto::TileBufType::get(ctx, {BK, BN}, elemType, matSpace, matCfg);
+  auto leftTileType =
+      pto::TileBufType::get(ctx, {BM, BK}, elemType, leftSpace, leftCfg);
+  auto rightTileType =
+      pto::TileBufType::get(ctx, {BK, BN}, elemType, rightSpace, rightCfg);
+  auto accTileType =
+      pto::TileBufType::get(ctx, {BM, BN}, elemType, accSpace, accCfg);
+
+  Value matATile =
+      builder.create<pto::AllocTileOp>(loc, matATileType, Value(), Value());
+  Value matBTile =
+      builder.create<pto::AllocTileOp>(loc, matBTileType, Value(), Value());
+  Value leftTile =
+      builder.create<pto::AllocTileOp>(loc, leftTileType, Value(), Value());
+  Value rightTile =
+      builder.create<pto::AllocTileOp>(loc, rightTileType, Value(), Value());
+  Value accTile =
+      builder.create<pto::AllocTileOp>(loc, accTileType, Value(), Value());
+
+  // --- Partition view types --------------------------------------------------
+  auto pvAType =
+      pto::PartitionTensorViewType::get(ctx, {BM, BK}, elemType);
+  auto pvBType =
+      pto::PartitionTensorViewType::get(ctx, {BK, BN}, elemType);
+  auto pvCType =
+      pto::PartitionTensorViewType::get(ctx, {BM, BN}, elemType);
+
+  // --- Sync flag attributes --------------------------------------------------
+  auto pipeMTE2 = pto::PipeAttr::get(ctx, pto::PIPE::PIPE_MTE2);
+  auto pipeMTE1 = pto::PipeAttr::get(ctx, pto::PIPE::PIPE_MTE1);
+  auto pipeM = pto::PipeAttr::get(ctx, pto::PIPE::PIPE_M);
+  auto pipeFIX = pto::PipeAttr::get(ctx, pto::PIPE::PIPE_FIX);
+  auto eventId0 = pto::EventAttr::get(ctx, pto::EVENT::EVENT_ID0);
+
+  // --- scf.for over K dimension: 0 to K/BK ----------------------------------
+  Value nKBlocks = builder.create<arith::CeilDivUIOp>(loc, kIdx, cBK);
+  auto forOp = builder.create<scf::ForOp>(loc, c0, nKBlocks, c1);
+  builder.setInsertionPointToStart(forOp.getBody());
+  Value kIter = forOp.getInductionVar();
+  Value kOff = builder.create<arith::MulIOp>(loc, kIter, cBK);
+
+  // Partition views for A[rowOff, kOff] and B[kOff, colOff].
+  Value pvA = builder.create<pto::PartitionViewOp>(
+      loc, pvAType, tvA,
+      SmallVector<Value>{rowOff, kOff}, SmallVector<Value>{cBM, cBK});
+  Value pvB = builder.create<pto::PartitionViewOp>(
+      loc, pvBType, tvB,
+      SmallVector<Value>{kOff, colOff}, SmallVector<Value>{cBK, cBN});
+
+  // tload A, B → mat tiles.
+  builder.create<pto::TLoadOp>(loc, TypeRange{}, pvA, matATile);
+  builder.create<pto::TLoadOp>(loc, TypeRange{}, pvB, matBTile);
+
+  // Sync: MTE2 → MTE1.
+  builder.create<pto::SetFlagOp>(loc, pipeMTE2, pipeMTE1, eventId0);
+  builder.create<pto::WaitFlagOp>(loc, pipeMTE2, pipeMTE1, eventId0);
+
+  // tmov: mat → left / right.
+  builder.create<pto::TMovOp>(loc, TypeRange{}, matATile, leftTile);
+  builder.create<pto::TMovOp>(loc, TypeRange{}, matBTile, rightTile);
+
+  // Sync: MTE1 → M.
+  builder.create<pto::SetFlagOp>(loc, pipeMTE1, pipeM, eventId0);
+  builder.create<pto::WaitFlagOp>(loc, pipeMTE1, pipeM, eventId0);
+
+  // First iteration: tmatmul; subsequent: tmatmul.acc.
+  Value isFirst = builder.create<arith::CmpIOp>(
+      loc, arith::CmpIPredicate::eq, kIter, c0);
+  auto ifOp = builder.create<scf::IfOp>(loc, isFirst, /*hasElse=*/true);
+
+  // then: k == 0 → tmatmul (clears accumulator).
+  builder.setInsertionPointToStart(&ifOp.getThenRegion().front());
+  builder.create<pto::TMatmulOp>(loc, TypeRange{}, leftTile, rightTile,
+                                 /*bias=*/Value(), accTile);
+
+  // else: k > 0 → tmatmul.acc (accumulate).
+  builder.setInsertionPointToStart(&ifOp.getElseRegion().front());
+  builder.create<pto::TMatmulAccOp>(loc, TypeRange{}, accTile, leftTile,
+                                    rightTile, accTile);
+
+  // After if.
+  builder.setInsertionPointAfter(ifOp);
+
+  // Sync: M → MTE2.
+  builder.create<pto::SetFlagOp>(loc, pipeM, pipeMTE2, eventId0);
+  builder.create<pto::WaitFlagOp>(loc, pipeM, pipeMTE2, eventId0);
+
+  // --- After loop: sync M → FIX, store C ------------------------------------
+  builder.setInsertionPointAfter(forOp);
+  builder.create<pto::SetFlagOp>(loc, pipeM, pipeFIX, eventId0);
+  builder.create<pto::WaitFlagOp>(loc, pipeM, pipeFIX, eventId0);
+
+  Value pvC = builder.create<pto::PartitionViewOp>(
+      loc, pvCType, tvC,
+      SmallVector<Value>{rowOff, colOff}, SmallVector<Value>{cBM, cBN});
+  builder.create<pto::TStoreOp>(loc, TypeRange{}, accTile, pvC);
+
+  builder.create<func::ReturnOp>(loc);
+
+  // Erase old Triton function.
+  ttFunc.erase();
+  return success();
 }
 
 //--- Pass --------------------------------------------------------------------

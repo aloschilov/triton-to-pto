@@ -148,11 +148,27 @@ def check_softmax(d, atol=1e-4):
     return _check("softmax", d, "v1.bin", expected, atol)
 
 
+def check_matmul(d, atol=1e-3):
+    """matmul_kernel(v1=A, v2=B, v3=C, ...): C = A @ B (f32).
+
+    A and B are square (M=N=K) row-major matrices.  The dimension is
+    inferred from file sizes: M = sqrt(len(v1)).
+    """
+    a = _load(d, "v1.bin")
+    b = _load(d, "v2.bin")
+    side = int(np.sqrt(len(a)))
+    A = a[: side * side].reshape(side, side)
+    B = b[: side * side].reshape(side, side)
+    expected = A @ B
+    return _check("matmul", d, "v3.bin", expected.ravel(), atol)
+
+
 KERNELS = {
     "vec_add": check_vec_add,
     "reduce_sum": check_reduce_sum,
     "unary_exp": check_unary_exp,
     "softmax": check_softmax,
+    "matmul": check_matmul,
 }
 
 

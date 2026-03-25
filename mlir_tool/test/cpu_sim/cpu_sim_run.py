@@ -54,12 +54,32 @@ _SOFTMAX_CONFIG = {
         "v1": {"n_elems": 4096, "init": "zeros"},
     },
 }
+_MATMUL_CONFIG = {
+    "scalars": {
+        "v4": 64,   # M
+        "v5": 64,   # N
+        "v6": 64,   # K
+        "v7": 64,   # stride_am (= K for row-major A)
+        "v8": 1,    # stride_ak
+        "v9": 64,   # stride_bk (= N for row-major B)
+        "v10": 1,   # stride_bn
+        "v11": 64,  # stride_cm (= N for row-major C)
+        "v12": 1,   # stride_cn
+    },
+    "buffers": {
+        "v1": {"n_elems": 4096, "init": "random", "seed": 42},   # A: 64x64
+        "v2": {"n_elems": 4096, "init": "random", "seed": 43},   # B: 64x64
+        "v3": {"n_elems": 4096, "init": "zeros"},                 # C: 64x64
+    },
+}
 
 KERNEL_CONFIGS = {
     "reduce_sum_kernel": _REDUCE_SUM_CONFIG,
     "reduce_sum_kernel_0": _REDUCE_SUM_CONFIG,
     "softmax_kernel": _SOFTMAX_CONFIG,
     "softmax_kernel_0": _SOFTMAX_CONFIG,
+    "matmul_kernel": _MATMUL_CONFIG,
+    "matmul_kernel_0": _MATMUL_CONFIG,
 }
 
 
