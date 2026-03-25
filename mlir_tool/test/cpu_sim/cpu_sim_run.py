@@ -40,21 +40,26 @@ CXX = os.environ.get("CPU_SIM_CXX", "g++-14")
 # to 1).  Kernels not listed fall back to the single-scalar heuristic.
 # ---------------------------------------------------------------------------
 
+_REDUCE_SUM_CONFIG = {
+    "scalars": {"v3": 256},
+    "buffers": {
+        "v1": {"n_elems": 256, "init": "random", "seed": 42},
+        "v2": {"n_elems": 8, "init": "zeros"},
+    },
+}
+_SOFTMAX_CONFIG = {
+    "scalars": {"v3": 256, "v4": 256, "v5": 16, "v6": 256},
+    "buffers": {
+        "v2": {"n_elems": 4096, "init": "random", "seed": 42},
+        "v1": {"n_elems": 4096, "init": "zeros"},
+    },
+}
+
 KERNEL_CONFIGS = {
-    "reduce_sum_kernel": {
-        "scalars": {"v3": 256},
-        "buffers": {
-            "v1": {"n_elems": 256, "init": "random", "seed": 42},
-            "v2": {"n_elems": 8, "init": "zeros"},
-        },
-    },
-    "softmax_kernel": {
-        "scalars": {"v3": 256, "v4": 256, "v5": 16, "v6": 256},
-        "buffers": {
-            "v2": {"n_elems": 4096, "init": "random", "seed": 42},
-            "v1": {"n_elems": 4096, "init": "zeros"},
-        },
-    },
+    "reduce_sum_kernel": _REDUCE_SUM_CONFIG,
+    "reduce_sum_kernel_0": _REDUCE_SUM_CONFIG,
+    "softmax_kernel": _SOFTMAX_CONFIG,
+    "softmax_kernel_0": _SOFTMAX_CONFIG,
 }
 
 
